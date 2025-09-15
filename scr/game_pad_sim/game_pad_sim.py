@@ -1,161 +1,199 @@
-# win_virtual_gamepad_tk.py
+import math
+import sys
 import tkinter as tk
-from tkinter import ttk
-import vgamepad as vg
 
-# ------- Helpers -------
-def lerp(val, src_min, src_max, dst_min, dst_max):
-    return int(dst_min + (val - src_min) * (dst_max - dst_min) / (src_max - src_min))
+# vgamepad: gói Python bọc ViGEm (Xbox 360/DS4 virtual)
+try:
+    import vgamepad as vg
+except ImportError:
+    print("Chưa cài 'vgamepad'. Hãy chạy: pip install vgamepad")
+    sys.exit(1)
 
-def scale_axis(v_0_100):
-    # Tkinter slider 0..100 -> XInput -32768..32767
-    return lerp(v_0_100, 0, 100, -32768, 32767)
 
-def scale_trigger(v_0_100):
-    # 0..100 -> 0..255
-    return lerp(v_0_100, 0, 100, 0, 255)
+class StickWidget:
+    """
+    Joystick hình tròn đơn giản: kéo núm trong phạm vi vòng tròn.
+    Trả về (x, y) đã chuẩn hoá trong [-1.0, 1.0], với (0,0) là tâm.
+    """
+    def __init__(self, parent, title="Stick", size=220, pad=12, radius_ratio=0.7, deadzone=0.05):
+        self.frame = tk.Frame(parent)
+        self.title = tk.Label(self.frame, text=title, font=("Segoe UI", 11, "bold"))
+        self.title.pack(pady=(0, 4))
 
-# ------- App -------
-class GamepadUI(tk.Tk):
+        self.size = size
+        self.canvas = tk.Canvas(self.frame, width=size, height=size, bg="#111", highlightthickness=0)
+        self.canvas.pack()
+
+        self.center = (size // 2, size // 2)
+        self.radius = int((size // 2 - pad) * radius_ratio)  # biên tối đa của cần
+        self.deadzone = deadzone
+
+        # Vẽ nền/biên
+        c = self.center
+        R = self.radius
+        self.canvas.create_oval(c[0]-R, c[1]-R, c[0]+R, c[1]+R, outline="#444", width=2)
+        self.canvas.create_line(c[0], 10, c[0], size-10, fill="#333")
+        self.canvas.create_line(10, c[1], size-10, c[1], fill="#333")
+
+        # Vẽ núm (thumb)
+        self.knob_r = 14
+        self.knob = self.canvas.create_oval(
+            c[0]-self.knob_r, c[1]-self.knob_r, c[0]+self.knob_r, c[1]+self.knob_r,
+            fill="#2c7", outline="#0b4"
+        )
+
+        # Trạng thái
+        self.dragging = False
+        self.norm_xy = (0.0, 0.0)
+
+        # Bind chuột
+        self.canvas.tag_bind(self.knob, "<ButtonPress-1>", self._on_press)
+        self.canvas.tag_bind(self.knob, "<B1-Motion>", self._on_drag)
+        self.canvas.tag_bind(self.knob, "<ButtonRelease-1>", self._on_release)
+
+        # Cho phép click nền để nhảy núm đến vị trí đó
+        self.canvas.bind("<ButtonPress-1>", self._on_press_anywhere)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        # Nhấn chuột phải để trả về tâm
+        self.canvas.bind("<Button-3>", lambda e: self.reset_to_center())
+
+    def pack(self, **kwargs):
+        self.frame.pack(**kwargs)
+
+    def _on_press_anywhere(self, event):
+        # Nếu bấm vào nền (không trúng knob), vẫn cho kéo
+        self._on_press(event)
+
+    def _on_press(self, event):
+        self.dragging = True
+        self._move_knob(event.x, event.y)
+
+    def _on_drag(self, event):
+        if self.dragging:
+            self._move_knob(event.x, event.y)
+
+    def _on_release(self, event):
+        self.dragging = False
+        # vẫn để nguyên vị trí; muốn auto snap về giữa thì bật dòng sau:
+        # self.reset_to_center()
+
+    def _move_knob(self, x, y):
+        # Hạn chế trong vòng tròn biên
+        cx, cy = self.center
+        dx = x - cx
+        dy = y - cy
+        dist = math.hypot(dx, dy)
+        if dist > self.radius:
+            scale = self.radius / dist
+            dx *= scale
+            dy *= scale
+            x = cx + dx
+            y = cy + dy
+
+        # Cập nhật hình
+        r = self.knob_r
+        self.canvas.coords(self.knob, x - r, y - r, x + r, y + r)
+
+        # Chuẩn hoá sang [-1, 1] (lưu ý: trục Y ngược để khớp tiêu chuẩn gamepad)
+        nx = dx / self.radius
+        ny = -dy / self.radius
+
+        # Áp deadzone
+        if math.hypot(nx, ny) < self.deadzone:
+            nx, ny = 0.0, 0.0
+
+        self.norm_xy = (max(-1.0, min(1.0, nx)), max(-1.0, min(1.0, ny)))
+
+    def reset_to_center(self):
+        cx, cy = self.center
+        r = self.knob_r
+        self.canvas.coords(self.knob, cx - r, cy - r, cx + r, cy + r)
+        self.norm_xy = (0.0, 0.0)
+
+    def get(self):
+        """Trả về (x, y) đã chuẩn hoá trong [-1.0, 1.0]."""
+        return self.norm_xy
+
+
+class App:
     def __init__(self):
-        super().__init__()
-        self.title("Virtual Xbox 360 Gamepad (ViGEm + vgamepad + Tkinter)")
-        self.geometry("620x420")
+        self.root = tk.Tk()
+        self.root.title("Virtual Gamepad (ViGEm + vgamepad) — 2 Joysticks")
 
-        # Tạo gamepad ảo
-        self.pad = vg.VX360Gamepad()
+        # Tạo tay cầm Xbox360 ảo
+        try:
+            self.gamepad = vg.VX360Gamepad()
+        except Exception as e:
+            tk.messagebox.showerror("Lỗi", f"Không khởi tạo được tay cầm ảo.\n{e}")
+            sys.exit(2)
 
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill="both", expand=True)
+        # Khung UI
+        wrap = tk.Frame(self.root, padx=12, pady=12, bg="#0a0a0a")
+        wrap.pack(fill="both", expand=True)
 
-        # ---- Left stick (X,Y) ----
-        lf_axes = ttk.LabelFrame(root, text="Left Stick")
-        lf_axes.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        # Hai joystick
+        sticks = tk.Frame(wrap, bg="#0a0a0a")
+        sticks.pack()
 
-        self.sld_x = ttk.Scale(lf_axes, from_=0, to=100, orient="horizontal")
-        self.sld_x.set(50)
-        self.sld_y = ttk.Scale(lf_axes, from_=0, to=100, orient="horizontal")
-        self.sld_y.set(50)
+        self.left = StickWidget(sticks, title="Left Stick (LX, LY)")
+        self.right = StickWidget(sticks, title="Right Stick (RX, RY)")
+        self.left.pack(side="left", padx=10)
+        self.right.pack(side="left", padx=10)
 
-        ttk.Label(lf_axes, text="X").grid(row=0, column=0, sticky="w")
-        self.sld_x.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Label(lf_axes, text="Y").grid(row=1, column=0, sticky="w")
-        self.sld_y.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        # Nút tiện ích
+        btns = tk.Frame(wrap, pady=10, bg="#0a0a0a")
+        btns.pack(fill="x")
+        tk.Button(btns, text="Center Both (Space)", command=self.center_both).pack(side="left")
+        tk.Button(btns, text="Quit (Esc)", command=self.quit).pack(side="right")
 
-        lf_axes.columnconfigure(1, weight=1)
+        # Phím tắt
+        self.root.bind("<space>", lambda e: self.center_both())
+        self.root.bind("<Escape>", lambda e: self.quit())
 
-        # ---- Triggers ----
-        lf_tr = ttk.LabelFrame(root, text="Triggers")
-        lf_tr.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
+        # Nhãn trạng thái
+        self.status = tk.StringVar(value="LX=0.00  LY=0.00   RX=0.00  RY=0.00")
+        tk.Label(wrap, textvariable=self.status, fg="#ddd", bg="#0a0a0a").pack(anchor="w", pady=(6, 0))
 
-        self.sld_lt = ttk.Scale(lf_tr, from_=0, to=100, orient="horizontal")
-        self.sld_rt = ttk.Scale(lf_tr, from_=0, to=100, orient="horizontal")
-        ttk.Label(lf_tr, text="LT").grid(row=0, column=0, sticky="w")
-        self.sld_lt.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Label(lf_tr, text="RT").grid(row=1, column=0, sticky="w")
-        self.sld_rt.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        lf_tr.columnconfigure(1, weight=1)
+        # Vòng cập nhật gửi trạng thái sang tay cầm ảo
+        self._tick()
 
-        # ---- Buttons ----
-        lf_btn = ttk.LabelFrame(root, text="Buttons")
-        lf_btn.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+    def center_both(self):
+        self.left.reset_to_center()
+        self.right.reset_to_center()
+        self._send_to_gamepad()  # gửi ngay
 
-        self.varA = tk.BooleanVar()
-        self.varB = tk.BooleanVar()
-        self.varX = tk.BooleanVar()
-        self.varY = tk.BooleanVar()
-        self.varLB = tk.BooleanVar()
-        self.varRB = tk.BooleanVar()
-        self.varStart = tk.BooleanVar()
-        self.varBack = tk.BooleanVar()
+    def _send_to_gamepad(self):
+        lx, ly = self.left.get()
+        rx, ry = self.right.get()
 
-        ttk.Checkbutton(lf_btn, text="A", variable=self.varA).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(lf_btn, text="B", variable=self.varB).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(lf_btn, text="X", variable=self.varX).grid(row=0, column=2, sticky="w")
-        ttk.Checkbutton(lf_btn, text="Y", variable=self.varY).grid(row=0, column=3, sticky="w")
-        ttk.Checkbutton(lf_btn, text="LB", variable=self.varLB).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(lf_btn, text="RB", variable=self.varRB).grid(row=1, column=1, sticky="w")
-        ttk.Checkbutton(lf_btn, text="Start", variable=self.varStart).grid(row=1, column=2, sticky="w")
-        ttk.Checkbutton(lf_btn, text="Back", variable=self.varBack).grid(row=1, column=3, sticky="w")
+        # Dùng API float chuẩn hoá [-1.0, 1.0]
+        self.gamepad.left_joystick_float(x_value_float=lx, y_value_float=ly)
+        self.gamepad.right_joystick_float(x_value_float=rx, y_value_float=ry)
 
-        for c in range(4):
-            lf_btn.columnconfigure(c, weight=1)
+        # Gửi report
+        self.gamepad.update()
 
-        # ---- D-pad ----
-        lf_dpad = ttk.LabelFrame(root, text="D-Pad")
-        lf_dpad.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
-
-        self.varUp = tk.BooleanVar()
-        self.varDown = tk.BooleanVar()
-        self.varLeft = tk.BooleanVar()
-        self.varRight = tk.BooleanVar()
-        ttk.Checkbutton(lf_dpad, text="Up", variable=self.varUp).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(lf_dpad, text="Left", variable=self.varLeft).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(lf_dpad, text="Right", variable=self.varRight).grid(row=1, column=2, sticky="w")
-        ttk.Checkbutton(lf_dpad, text="Down", variable=self.varDown).grid(row=2, column=1, sticky="w")
-        for c in range(3):
-            lf_dpad.columnconfigure(c, weight=1)
-
-        # ---- Polling loop (≈60 Hz) ----
-        self.after(16, self._tick)
-
-        # Đặt tỉ lệ co giãn
-        for i in range(2):
-            root.rowconfigure(i, weight=1)
-        for j in range(2):
-            root.columnconfigure(j, weight=1)
-
-        # Đặt lại về mặc định khi đóng
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.status.set(f"LX={lx:+.2f}  LY={ly:+.2f}   RX={rx:+.2f}  RY={ry:+.2f}")
 
     def _tick(self):
-        # Axes
-        x = scale_axis(self.sld_x.get())
-        y = scale_axis(self.sld_y.get())
-        self.pad.left_joystick(x_value=x, y_value=y)
+        # gọi đều đặn để phản ánh mọi thay đổi kéo thả
+        self._send_to_gamepad()
+        # 60 Hz ~ 16 ms; ở đây chọn 10–15 ms cho phản hồi mượt
+        self.root.after(15, self._tick)
 
-        # Triggers
-        lt = scale_trigger(self.sld_lt.get())
-        rt = scale_trigger(self.sld_rt.get())
-        self.pad.left_trigger(value=lt)
-        self.pad.right_trigger(value=rt)
-
-        # Buttons map
-        self._set_button(self.varA, vg.XUSB_BUTTON.XUSB_GAMEPAD_A)
-        self._set_button(self.varB, vg.XUSB_BUTTON.XUSB_GAMEPAD_B)
-        self._set_button(self.varX, vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
-        self._set_button(self.varY, vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-        self._set_button(self.varLB, vg.XUSB_BUTTON.XUSB_GAMEPAD_LEFT_SHOULDER)
-        self._set_button(self.varRB, vg.XUSB_BUTTON.XUSB_GAMEPAD_RIGHT_SHOULDER)
-        self._set_button(self.varStart, vg.XUSB_BUTTON.XUSB_GAMEPAD_START)
-        self._set_button(self.varBack, vg.XUSB_BUTTON.XUSB_GAMEPAD_BACK)
-
-        # D-pad (dạng button riêng lẻ trong XInput)
-        self._set_button(self.varUp, vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_UP)
-        self._set_button(self.varDown, vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_DOWN)
-        self._set_button(self.varLeft, vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_LEFT)
-        self._set_button(self.varRight, vg.XUSB_BUTTON.XUSB_GAMEPAD_DPAD_RIGHT)
-
-        # Gửi state tới driver
-        self.pad.update()
-
-        # Lặp tiếp
-        self.after(16, self._tick)
-
-    def _set_button(self, var, button_const):
-        if var.get():
-            self.pad.press_button(button=button_const)
-        else:
-            self.pad.release_button(button=button_const)
-
-    def on_close(self):
+    def quit(self):
         try:
-            # Đưa mọi thứ về neutral
-            self.pad.reset()
-            self.pad.update()
+            # Đặt về 0 trước khi thoát để tránh trục kẹt
+            self.left.reset_to_center()
+            self.right.reset_to_center()
+            self._send_to_gamepad()
         except Exception:
             pass
-        self.destroy()
+        self.root.destroy()
+
 
 if __name__ == "__main__":
-    GamepadUI().mainloop()
+    App().__init__()
+    tk.mainloop()

@@ -1,0 +1,2 @@
+B1: Cài ViGEmBus
+B2: pip install vgamepad

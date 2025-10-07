@@ -4,10 +4,11 @@ from ultralytics import YOLO
 
 import cv2
 
-model = YOLO("yolo_weights/yolov8x.pt")
+model = YOLO("yolo_weights/yolov8m.pt")
 
-results = model.predict(source="0", #nguồn hình ảnh
+results = model.predict(source="drone_footages/Whiteman.mp4", #nguồn hình ảnh
                         conf=0.3, #độ chính xác
                         device="cuda", #phần cứng xử lý
                         classes=[0], #đối tượng quét
+                        save=True, #lưu video  
                         show=True)

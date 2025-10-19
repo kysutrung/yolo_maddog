@@ -66,7 +66,7 @@ def video_loop():
             frame,
             conf=0.3,
             device='cuda',     # nếu không có GPU, đổi thành 'cpu'
-            classes=[39],      # 39 = "bottle" trong COCO
+            classes=[0],      # 39 = "bottle" trong COCO
             verbose=False
         )
         boxes = results[0].boxes

@@ -1,3 +1,6 @@
+Note: Đã thu xong dữ liệu dự án, đã thử và thấy rất ok, đợi lập trình
+
+Hướng dẫn cài tổng thể dự án
 B1: Cài ViGEmBus
 B2: pip install vgamepad
 

@@ -1,5 +1,5 @@
 # yolo_gamepad_forward_tk_spacer.py
-# GUI with flexible spacing and compact log panel (English version, compact controls + restore selection on reappear)
+# GUI with flexible spacing and compact log panel (English version, compact controls + restore selection on reappear + Flight Mode buttons)
 
 import os
 import cv2
@@ -50,7 +50,8 @@ THEME_PAD        = 10
 def dz(v, d=DEADZONE): return 0.0 if abs(v) < d else v
 
 class ForwardState:
-    OFF, ARMING, ON = "Auto", "ARMING", "Manual"
+    # NOTE: naming kept for backward compatibility vs existing logic
+    OFF, ARMING, ON = "Auto", "Arming", "Manual"
 
 def draw_tracks(frame, res, selected_id, names, show=True):
     if not show:
@@ -127,12 +128,13 @@ class GamepadBridge:
         try:
             pygame.event.pump()
             if SWAP_REAL_LR:
+                # Swap L/R as requested: left stick reads from RX/RY, right from LX/LY
                 lx, ly, rx, ry = [dz(self.js.get_axis(a)) for a in [AX_RX, AX_RY, AX_LX, AX_LY]]
             else:
                 lx, ly, rx, ry = [dz(self.js.get_axis(a)) for a in [AX_LX, AX_LY, AX_RX, AX_RY]]
-        except:
-            lx = ly = rx = ry = 0
-        self.r_lx, self.r_ly, self.r_rx, self.r_ry = [max(-1,min(1,v)) for v in [lx,ly,rx,ry]]
+        except Exception:
+            lx = ly = rx = ry = 0.0
+        self.r_lx, self.r_ly, self.r_rx, self.r_ry = [max(-1,min(1,float(v))) for v in [lx,ly,rx,ry]]
         return self.r_lx, self.r_ly, self.r_rx, self.r_ry
 
     def send_to_virtual(self, lx, ly, rx, ry):
@@ -154,7 +156,7 @@ class App(tk.Tk):
 
         self.selected_id = None
         self.available_ids = []
-        self.running = True
+        self.running = True   # <-- fixed indentation here
         self.frame_lock = threading.Lock()
         self.latest_bgr = None
         self.video_ready = False
@@ -168,10 +170,13 @@ class App(tk.Tk):
         self.lock_target = False
         self.lock_btn_var = tk.StringVar(value="Target Lock: OFF")
 
+        # Flight Mode buttons (enable only in Auto)
+        self._flight_btns = []
+
         # Lock signature (for hard lock) and reselect signature (for auto-restore without lock)
-        self.lock_signature = None              # tuple(id, cls_id, cls_name)
-        self.reselect_signature = None          # tuple(id, cls_id, cls_name) saved on last natural selection
-        self.last_tracks = {}                   # id -> cls_id for current frame
+        self.lock_signature = None
+        self.reselect_signature = None
+        self.last_tracks = {}
 
         # log queue
         self.log_queue = queue.Queue()
@@ -193,6 +198,7 @@ class App(tk.Tk):
         self.log(f"Model: {WEIGHTS} | GPU: {'ON' if USE_GPU else 'OFF'}")
         self.log(f"Gamepad: {self.gp.pad_name}")
         self._update_target_controls_state()
+        self._update_flight_mode_controls()
 
     # ---------- Styles ----------
     def _init_styles(self):
@@ -200,6 +206,7 @@ class App(tk.Tk):
         style.configure("Compact.TButton", font=("Segoe UI", 9), padding=(6, 2))
         style.configure("Compact.TLabel", font=("Segoe UI", 9))
         style.configure("Section.TLabel", font=("Segoe UI", 10, "bold"))
+        style.configure("Flight.TButton", font=("Segoe UI", 9), padding=(6, 2))
 
     # ---------- Utility ----------
     def log(self, message: str):
@@ -223,6 +230,13 @@ class App(tk.Tk):
             cls_name = str(cls_id)
         return int(cls_id), cls_name
 
+    def _update_flight_mode_controls(self):
+        """Enable 6 flight buttons only when state == Auto (ForwardState.OFF)."""
+        enable = (self.gp.state == ForwardState.OFF)
+        state = "normal" if enable else "disabled"
+        for b in self._flight_btns:
+            b.configure(state=state)
+
     # ---------- UI ----------
     def _build_ui(self):
         root = ttk.Frame(self, padding=THEME_PAD)
@@ -245,7 +259,7 @@ class App(tk.Tk):
         ttk.Frame(root).pack(side="left", fill="both", expand=True)
 
         # ===== 1) Target Control (compact) =====
-        ttk.Label(right, text="Target Control", style="Section.TLabel").pack(anchor="w", pady=(0,4))
+        ttk.Label(right, text="Target Tracking", style="Section.TLabel").pack(anchor="w", pady=(0,4))
         tc = ttk.Frame(right)
         tc.pack(fill="x", pady=(0,4))
         self.btn_prev   = ttk.Button(tc, text="◀ A",   command=self.on_key_a, style="Compact.TButton", width=8)
@@ -269,12 +283,38 @@ class App(tk.Tk):
         toggles.grid_columnconfigure(0, weight=1, uniform="tog")
         toggles.grid_columnconfigure(1, weight=1, uniform="tog")
 
-        # ===== 2) Manual Control =====
+        # ===== 2) Flight Mode =====
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        self.state_var = tk.StringVar(value=f"Manual Control: {self.gp.state}")
+        self.state_var = tk.StringVar(value=f"Flight Mode: {self.gp.state}")
         ttk.Label(right, textvariable=self.state_var, style="Section.TLabel").pack(anchor="w", pady=(0,4))
+
+        # ---- Switch Mode button ABOVE the 6 direction buttons ----
         ttk.Button(right, text="Switch Mode", command=self.toggle_forward,
                    style="Compact.TButton").pack(fill="x", pady=(0,6))
+
+        # 6 mini buttons (enabled only when Auto)
+        fm = ttk.Frame(right)
+        fm.pack(fill="x", pady=(0,6))
+        mk = lambda t, cmd: ttk.Button(fm, text=t, command=cmd, style="Flight.TButton", width=10)
+
+        self.btn_forward = mk("Forward", self.cmd_forward)
+        self.btn_back    = mk("Back",    self.cmd_back)
+        self.btn_up      = mk("Up",      self.cmd_up)
+        self.btn_left    = mk("Left",    self.cmd_left)
+        self.btn_right   = mk("Right",   self.cmd_right)
+        self.btn_down    = mk("Down",    self.cmd_down)
+
+        self.btn_forward.grid(row=0, column=0, padx=(0,4), pady=(0,4), sticky="ew")
+        self.btn_back.grid(   row=0, column=1, padx=4,     pady=(0,4), sticky="ew")
+        self.btn_up.grid(     row=0, column=2, padx=(4,0), pady=(0,4), sticky="ew")
+        self.btn_left.grid(   row=1, column=0, padx=(0,4), sticky="ew")
+        self.btn_right.grid(  row=1, column=1, padx=4,     sticky="ew")
+        self.btn_down.grid(   row=1, column=2, padx=(4,0), sticky="ew")
+
+        for c in range(3):
+            fm.grid_columnconfigure(c, weight=1, uniform="fm")
+
+        self._flight_btns = [self.btn_forward, self.btn_back, self.btn_left, self.btn_right, self.btn_up, self.btn_down]
 
         # ===== 3) Control Parameters =====
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
@@ -331,33 +371,28 @@ class App(tk.Tk):
         s = self.gp.state
         self.gp.state = ForwardState.ON if s == ForwardState.ARMING \
                         else (ForwardState.ARMING if s == ForwardState.OFF else ForwardState.OFF)
-        self.state_var.set(f"Manual Control: {self.gp.state}")
-        self.log(f"Manual Control -> {self.gp.state}")
+        self.state_var.set(f"Flight Mode: {self.gp.state}")
+        self._update_flight_mode_controls()
+        self.log(f"Flight Mode -> {self.gp.state}")
 
     def toggle_bboxes(self):
-        # Prevent turning OFF OD while lock is active
         if self.show_boxes and self.lock_target:
             self.log("Blocked: Target Lock is active, cannot turn OFF Object Detection")
             self.bbox_btn_var.set("Object Detection: ON")
             return
-
         prev = self.show_boxes
         self.show_boxes = not self.show_boxes
         self.bbox_btn_var.set(f"Object Detection: {'ON' if self.show_boxes else 'OFF'}")
         self.log(f"Object Detection -> {'ON' if self.show_boxes else 'OFF'}")
-
-        # When turning OD OFF: deselect current target and clear reselect_signature (user intent)
         if prev and not self.show_boxes:
             if self.selected_id is not None:
                 self.log(f"Object Detection turned OFF -> deselected ID={self.selected_id}")
             self.selected_id = None
-            self.reselect_signature = None   # do not auto-restore after user turns OD off
+            self.reselect_signature = None
             self.log("No target is currently selected")
-
         self._update_target_controls_state()
 
     def toggle_lock(self):
-        # Cannot enable lock while OD is OFF
         if not self.show_boxes:
             self.lock_target = False
             self.lock_btn_var.set("Target Lock: OFF")
@@ -365,18 +400,13 @@ class App(tk.Tk):
             self.log("No target is currently selected")
             self._update_target_controls_state()
             return
-
-        # Require a selected target to lock
         if self.selected_id is None and not self.lock_target:
             self.log("Blocked: Select a target before enabling Target Lock")
             self.lock_target = False
             self.lock_btn_var.set("Target Lock: OFF")
             self._update_target_controls_state()
             return
-
-        # Toggle
         if not self.lock_target:
-            # Turning ON -> capture lock signature from current selection
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
             if cls_id is None:
                 self.log("Blocked: Cannot read target class -> lock aborted")
@@ -386,12 +416,10 @@ class App(tk.Tk):
             self.lock_btn_var.set("Target Lock: ON")
             self.log(f"Target Lock -> ON (ID={self.lock_signature[0]}, class={self.lock_signature[2]})")
         else:
-            # Turning OFF -> clear signature
             self.lock_target = False
             self.lock_btn_var.set("Target Lock: OFF")
             self.log("Target Lock -> OFF")
             self.lock_signature = None
-
         self._update_target_controls_state()
 
     # Selection handlers (blocked when OD off or Lock on)
@@ -412,7 +440,6 @@ class App(tk.Tk):
             else:
                 self.log("No available targets to select")
         else:
-            # Manual deselect -> clear reselect signature (user intent)
             self.log("Target deselected")
             self.selected_id = None
             self.reselect_signature = None
@@ -463,6 +490,37 @@ class App(tk.Tk):
         else:
             self.log("No available targets")
 
+    # ----- Flight Mode 6-button commands (only act in Auto) -----
+    def _flight_cmd_guard(self, name: str) -> bool:
+        if self.gp.state != ForwardState.OFF:
+            self.log(f"Ignored ({name}): Flight Mode is not Auto")
+            return False
+        return True
+
+    def cmd_forward(self):
+        if not self._flight_cmd_guard("forward"): return
+        self.log("Flight command: forward")
+
+    def cmd_back(self):
+        if not self._flight_cmd_guard("back"): return
+        self.log("Flight command: back")
+
+    def cmd_left(self):
+        if not self._flight_cmd_guard("left"): return
+        self.log("Flight command: left")
+
+    def cmd_right(self):
+        if not self._flight_cmd_guard("right"): return
+        self.log("Flight command: right")
+
+    def cmd_up(self):
+        if not self._flight_cmd_guard("up"): return
+        self.log("Flight command: up")
+
+    def cmd_down(self):
+        if not self._flight_cmd_guard("down"): return
+        self.log("Flight command: down")
+
     def _loop_worker(self):
         gen = self.model.track(source=CAM_INDEX, conf=CONF_THRES,
                                device="cuda" if USE_GPU else "cpu",
@@ -471,10 +529,9 @@ class App(tk.Tk):
         while self.running:
             try:
                 res = next(gen)
-            except:
+            except Exception:
                 continue
 
-            # Build last_tracks: id -> cls_id for this frame
             self.last_tracks = {}
             if res.boxes is not None and len(res.boxes) > 0:
                 ids = res.boxes.id.detach().cpu().numpy().astype(int) if res.boxes.id is not None else None
@@ -486,31 +543,26 @@ class App(tk.Tk):
             frame = res.orig_img.copy()
             self.available_ids = sorted(self.last_tracks.keys())
 
-            # ===== Reacquire logic =====
-            # Priority 1: Target Lock signature
+            # Reacquire logic
             if self.lock_target and self.lock_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.lock_signature
                 if sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
                     self.selected_id = sig_id
-                    # also update reselect signature to this locked target
                     self.reselect_signature = (sig_id, sig_cls_id, sig_cls_name)
                     self.log(f"Reacquired locked target ID={sig_id} class={sig_cls_name}")
 
-            # Priority 2: Auto-restore previous selection (no lock required)
             if (not self.lock_target) and self.reselect_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.reselect_signature
                 if sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
                     self.selected_id = sig_id
                     self.log(f"Restored selection for target ID={sig_id} class={sig_cls_name}")
 
-            # If selected target no longer present -> deselect (keep reselect_signature for auto-restore)
             if self.selected_id is not None and self.selected_id not in self.available_ids:
                 self.log(f"Lost target ID={self.selected_id} (out of view)")
-                # Save signature for restore if we can read class
                 cls_id, cls_name = self._get_class_for_id(self.selected_id)
                 if cls_id is not None:
                     self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name))
-                self.selected_id = None  # do not clear reselect_signature here
+                self.selected_id = None
 
             # Manual control I/O
             r_lx, r_ly, r_rx, r_ry = self.gp.read_axes_real()
@@ -537,6 +589,7 @@ class App(tk.Tk):
 
     def _update_ui(self):
         self.state_var.set(f"Flight Mode: {self.gp.state}")
+        self._update_flight_mode_controls()
         self.pad_name_var.set(self.gp.pad_name)
         vals = [self.gp.r_lx, self.gp.r_ly, self.gp.r_rx, self.gp.r_ry]
         for var, v in zip(self.real_vars, vals):
@@ -545,7 +598,6 @@ class App(tk.Tk):
         for var, v in zip(self.virt_vars, vals):
             var.set(f"{v:+.3f}")
 
-        # flush logs
         while not self.log_queue.empty():
             try:
                 line = self.log_queue.get_nowait()

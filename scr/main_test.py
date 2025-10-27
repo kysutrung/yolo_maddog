@@ -168,6 +168,10 @@ class App(tk.Tk):
         self.lock_target = False
         self.lock_btn_var = tk.StringVar(value="Target Lock: OFF")
 
+        # NEW: Target Follow state
+        self.target_follow = False
+        self.follow_btn_var = tk.StringVar(value="Target Follow: OFF")
+
         # lọc theo lớp
         self.filter_var = tk.StringVar(value="All")
         self.display_allowed = None  # None => All
@@ -243,6 +247,10 @@ class App(tk.Tk):
         state = "normal" if enabled else "disabled"
         for b in (self.btn_prev, self.btn_select, self.btn_next):
             b.configure(state=state)
+
+        # Enable/disable Target Follow button:
+        follow_enabled = (self.show_boxes and self.selected_id is not None)
+        self.btn_follow.configure(state=("normal" if follow_enabled else "disabled"))
 
     def _get_class_for_id(self, tid):
         if tid is None: return None, None
@@ -389,6 +397,16 @@ class App(tk.Tk):
             self.btn_yaw_left, self.btn_yaw_right
         ]
 
+        # === NEW: Spacer + Target Follow button (đặt NGAY BÊN DƯỚI cụm điều hướng) ===
+        ttk.Frame(right, height=8).pack(fill="x")  # khoảng cách nhỏ để tránh bấm nhầm
+        self.btn_follow = ttk.Button(
+            right,
+            textvariable=self.follow_btn_var,
+            command=self.toggle_follow,
+            style="Compact.TButton"
+        )
+        self.btn_follow.pack(fill="x", pady=(0,6))
+
         # Bind press/release để ramp khi ở Auto
         self.btn_forward.bind("<ButtonPress-1>", self._forward_press)
         self.btn_forward.bind("<ButtonRelease-1>", self._forward_release)
@@ -448,7 +466,7 @@ class App(tk.Tk):
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(
             right,
-            text="ESC: Quit | S: select/clear | A/D: prev/next | Toggles: OD / Lock",
+            text="ESC: Quit | S: select/clear | A/D: prev/next | Toggles: OD / Lock / Follow",
             style="Compact.TLabel",
             wraplength=RIGHT_PANEL_W-16, justify="left"
         ).pack(anchor="w")
@@ -486,6 +504,11 @@ class App(tk.Tk):
                 self.log(f"Object Detection turned OFF -> deselected ID={self.selected_id}")
             self.selected_id = None
             self.reselect_signature = None
+            # ALSO turn off Target Follow when OD is OFF
+            if self.target_follow:
+                self.target_follow = False
+                self.follow_btn_var.set("Target Follow: OFF")
+                self.log("Target Follow -> OFF (Object Detection OFF)")
             self.log("No target is currently selected")
         self._update_target_controls_state()
 
@@ -519,6 +542,32 @@ class App(tk.Tk):
             self.lock_signature = None
         self._update_target_controls_state()
 
+    # NEW: Target Follow toggle
+    def toggle_follow(self):
+        if not self.show_boxes:
+            self.target_follow = False
+            self.follow_btn_var.set("Target Follow: OFF")
+            self.log("Blocked: Object Detection is OFF -> cannot enable Target Follow")
+            self._update_target_controls_state()
+            return
+        if self.selected_id is None:
+            self.target_follow = False
+            self.follow_btn_var.set("Target Follow: OFF")
+            self.log("Blocked: No target selected -> cannot enable Target Follow")
+            self._update_target_controls_state()
+            return
+
+        self.target_follow = not self.target_follow
+        self.follow_btn_var.set(f"Target Follow: {'ON' if self.target_follow else 'OFF'}")
+        if self.target_follow:
+            cls_id, cls_name = self._get_class_for_id(self.selected_id)
+            if cls_name is not None:
+                self.log(f"Target Follow -> ON (ID={self.selected_id}, class={cls_name})")
+            else:
+                self.log(f"Target Follow -> ON (ID={self.selected_id})")
+        else:
+            self.log("Target Follow -> OFF")
+
     # --- Selection handlers ---
     def on_key_s(self):
         if not self.show_boxes:
@@ -538,8 +587,14 @@ class App(tk.Tk):
                 self.log("Target deselected")
                 self.selected_id = None
                 self.reselect_signature = None
+                # If following, turn off since no selection
+                if self.target_follow:
+                    self.target_follow = False
+                    self.follow_btn_var.set("Target Follow: OFF")
+                    self.log("Target Follow -> OFF (no target selected)")
         else:
             self.log("No available targets to select")
+        self._update_target_controls_state()
 
     def on_key_d(self):
         if not self.show_boxes:
@@ -563,6 +618,7 @@ class App(tk.Tk):
             self.log(f"Selected target ID={self.selected_id}")
         else:
             self.log("No available targets")
+        self._update_target_controls_state()
 
     def on_key_a(self):
         if not self.show_boxes:
@@ -586,6 +642,7 @@ class App(tk.Tk):
             self.log(f"Selected target ID={self.selected_id}")
         else:
             self.log("No available targets")
+        self._update_target_controls_state()
 
     # ----- Flight Mode 6-button commands (only act in Auto) -----
     def _flight_cmd_guard(self, name: str) -> bool:
@@ -784,6 +841,11 @@ class App(tk.Tk):
                 if cls_id is not None:
                     self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name))
                 self.selected_id = None
+                # If following while lost -> keep OFF to avoid confusion
+                if self.target_follow:
+                    self.target_follow = False
+                    self.follow_btn_var.set("Target Follow: OFF")
+                    self.log("Target Follow -> OFF (target lost)")
 
             # Manual control I/O
             r_lx, r_ly, r_rx, r_ry = self.gp.read_axes_real()

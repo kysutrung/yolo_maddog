@@ -51,13 +51,10 @@ THEME_PAD        = 10
 def dz(v, d=DEADZONE): return 0.0 if abs(v) < d else v
 
 class ForwardState:
-    # NOTE: naming kept for backward compatibility vs existing logic
+    # giữ tên cũ để tương thích
     OFF, ARMING, ON = "Auto", "Arming", "Manual"
 
 def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None):
-    """
-    allowed_classes: None => không lọc, hoặc set/list các class id cho phép hiển thị.
-    """
     if not show:
         return frame
     if res.boxes is None or len(res.boxes) == 0:
@@ -70,10 +67,8 @@ def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None)
 
     for i, (x1, y1, x2, y2) in enumerate(xyxy):
         cls_i = int(clss[i]) if i < len(clss) else 0
-        # Lọc hiển thị theo combobox
         if (allowed_classes is not None) and (cls_i not in allowed_classes):
             continue
-
         label = names.get(cls_i, str(cls_i)) if isinstance(names, dict) else str(cls_i)
         track_id = int(ids[i]) if ids is not None and i < len(ids) else -1
         color, thick = ((0,0,255),3) if selected_id == track_id else ((0,255,0),2)
@@ -84,11 +79,6 @@ def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None)
         cv2.rectangle(frame,(x1,y_text-th-6),(x1+tw+6,y_text+2),(0,0,0),-1)
         cv2.putText(frame, txt, (x1+3,y_text), cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2,cv2.LINE_AA)
     return frame
-
-def get_available_ids(res):
-    if res.boxes is None or res.boxes.id is None:
-        return []
-    return sorted(set(res.boxes.id.detach().cpu().numpy().astype(int).tolist()))
 
 def next_higher(lst, cur): return next((x for x in lst if x > cur), None)
 def next_lower(lst, cur):
@@ -112,7 +102,7 @@ def resize_with_letterbox(bgr, target_w, target_h):
 class GamepadBridge:
     def __init__(self):
         self.pad_name = "N/A"; self.pygame_ok = self.vpad_ok = False
-        self.state = ForwardState.OFF
+        self.state = ForwardState.ON   # DEFAULT = Manual
         self.v_lx = self.v_ly = self.v_rx = self.v_ry = 0.0
         self.r_lx = self.r_ly = self.r_rx = self.r_ry = 0.0
         if pygame:
@@ -137,7 +127,6 @@ class GamepadBridge:
         try:
             pygame.event.pump()
             if SWAP_REAL_LR:
-                # Swap L/R as requested: left stick reads from RX/RY, right from LX/LY
                 lx, ly, rx, ry = [dz(self.js.get_axis(a)) for a in [AX_RX, AX_RY, AX_LX, AX_LY]]
             else:
                 lx, ly, rx, ry = [dz(self.js.get_axis(a)) for a in [AX_LX, AX_LY, AX_RX, AX_RY]]
@@ -165,7 +154,7 @@ class App(tk.Tk):
 
         self.selected_id = None
         self.available_ids = []
-        self.running = True   # <-- fixed indentation here
+        self.running = True
         self.frame_lock = threading.Lock()
         self.latest_bgr = None
         self.video_ready = False
@@ -173,21 +162,20 @@ class App(tk.Tk):
         self.model = YOLO(WEIGHTS)
         self.names = self.model.model.names if hasattr(self.model, "model") else self.model.names
 
-        # state variables
+        # trạng thái hiển thị & chọn mục tiêu
         self.show_boxes = False
         self.bbox_btn_var = tk.StringVar(value="Object Detection: OFF")
         self.lock_target = False
         self.lock_btn_var = tk.StringVar(value="Target Lock: OFF")
 
-        # --- Lọc hiển thị theo Combobox ---
-        # None = All; {0} person; {2} car; {3} motorcycle
+        # lọc theo lớp
         self.filter_var = tk.StringVar(value="All")
         self.display_allowed = None  # None => All
 
-        # Flight Mode buttons (enable only in Auto)
+        # flight buttons (chỉ enable khi Auto)
         self._flight_btns = []
 
-        # Signatures
+        # reselect / lock
         self.lock_signature = None
         self.reselect_signature = None
         self.last_tracks = {}   # id -> cls_id
@@ -197,6 +185,29 @@ class App(tk.Tk):
 
         # styles
         self._init_styles()
+
+        # ---- Auto ramp settings (LX, RX, RY) ----
+        # Có thể chỉnh riêng giới hạn & bước ramp cho từng trục
+        self.RY_CAP = 0.200; self.RY_STEP = 0.006
+        self.RX_CAP = 0.200; self.RX_STEP = 0.006
+        self.LX_CAP = 0.200; self.LX_STEP = 0.006
+
+        # Giá trị hiện tại (Auto) gửi ra vgamepad
+        self.auto_ry = 0.0
+        self.auto_rx = 0.0
+        self.auto_lx = 0.0
+
+        # Trạng thái giữ nút
+        self._ramp_job = None
+        self._forward_holding = False
+        self._back_holding    = False
+        self._left_holding    = False
+        self._right_holding   = False
+        self._yaw_left_holding  = False
+        self._yaw_right_holding = False
+
+        # giữ LY khi vào Auto
+        self.auto_ly_hold = 0.0
 
         self._build_ui()
 
@@ -245,7 +256,6 @@ class App(tk.Tk):
         return int(cls_id), cls_name
 
     def _update_flight_mode_controls(self):
-        """Enable 6 flight buttons only when state == Auto (ForwardState.OFF)."""
         enable = (self.gp.state == ForwardState.OFF)
         state = "normal" if enable else "disabled"
         for b in self._flight_btns:
@@ -262,28 +272,21 @@ class App(tk.Tk):
             return {2}
         if label in ("motorcycle", "xe máy", "xe may", "motorbike"):
             return {3}
-        # default: All
         return None
 
     def _rebuild_available_ids(self):
-        """Cập nhật available_ids theo bộ lọc hiển thị hiện tại."""
         if self.display_allowed is None:
             self.available_ids = sorted(self.last_tracks.keys())
         else:
             self.available_ids = sorted([tid for tid, cls in self.last_tracks.items() if cls in self.display_allowed])
-
-        # nếu selection hiện tại không thuộc filter => bỏ chọn
-        if self.selected_id is not None:
-            if self.selected_id not in self.available_ids:
-                self.log(f"Current target ID={self.selected_id} is hidden by filter -> deselect")
-                self.selected_id = None
-                # giữ reselect_signature để có thể khôi phục nếu đổi filter lại
+        if self.selected_id is not None and self.selected_id not in self.available_ids:
+            self.log(f"Current target ID={self.selected_id} is hidden by filter -> deselect")
+            self.selected_id = None
         self._update_target_controls_state()
 
     def on_filter_change(self, *_):
         self.display_allowed = self._filter_label_to_allowed(self.filter_var.get())
-        human = self.filter_var.get()
-        self.log(f"Object filter -> {human}")
+        self.log(f"Object filter -> {self.filter_var.get()}")
         self._rebuild_available_ids()
 
     # ---------- UI ----------
@@ -307,7 +310,7 @@ class App(tk.Tk):
 
         ttk.Frame(root).pack(side="left", fill="both", expand=True)
 
-        # ===== 1) Target Control (compact) =====
+        # ===== 1) Target Control =====
         ttk.Label(right, text="Target Tracking", style="Section.TLabel").pack(anchor="w", pady=(0,4))
         tc = ttk.Frame(right)
         tc.pack(fill="x", pady=(0,4))
@@ -321,7 +324,7 @@ class App(tk.Tk):
         tc.grid_columnconfigure(1, weight=1, uniform="tc")
         tc.grid_columnconfigure(2, weight=1, uniform="tc")
 
-        # --- Toggle OD / Lock ---
+        # Toggle OD / Lock
         toggles = ttk.Frame(right)
         toggles.pack(fill="x", pady=(0,6))
         self.btn_bbox = ttk.Button(toggles, textvariable=self.bbox_btn_var,
@@ -333,7 +336,7 @@ class App(tk.Tk):
         toggles.grid_columnconfigure(0, weight=1, uniform="tog")
         toggles.grid_columnconfigure(1, weight=1, uniform="tog")
 
-        # --- Combobox lọc object để hiển thị ---
+        # Combobox lọc
         filt_row = ttk.Frame(right)
         filt_row.pack(fill="x", pady=(0,6))
         ttk.Label(filt_row, text="Show:", style="Compact.TLabel", width=8).grid(row=0, column=0, sticky="w")
@@ -360,7 +363,7 @@ class App(tk.Tk):
         mk = lambda t, cmd: ttk.Button(fm, text=t, command=cmd, style="Flight.TButton", width=10)
 
         self.btn_forward = mk("Forward", self.cmd_forward)
-        self.btn_back    = mk("Back",    self.cmd_back)
+        self.btn_back    = mk("Backward", self.cmd_back)
         self.btn_up      = mk("Up",      self.cmd_up)
         self.btn_left    = mk("Left",    self.cmd_left)
         self.btn_right   = mk("Right",   self.cmd_right)
@@ -372,9 +375,33 @@ class App(tk.Tk):
         self.btn_left.grid(   row=1, column=0, padx=(0,4), sticky="ew")
         self.btn_right.grid(  row=1, column=1, padx=4,     sticky="ew")
         self.btn_down.grid(   row=1, column=2, padx=(4,0), sticky="ew")
+
+        # Hàng mới: Yaw Left / Yaw Right
+        self.btn_yaw_left  = mk("Yaw Left",  lambda: None)
+        self.btn_yaw_right = mk("Yaw Right", lambda: None)
+        self.btn_yaw_left.grid( row=2, column=0, padx=(0,4), pady=(0,4), sticky="ew")
+        self.btn_yaw_right.grid(row=2, column=1, padx=4,     pady=(0,4), sticky="ew")
+
         for c in range(3):
             fm.grid_columnconfigure(c, weight=1, uniform="fm")
-        self._flight_btns = [self.btn_forward, self.btn_back, self.btn_left, self.btn_right, self.btn_up, self.btn_down]
+        self._flight_btns = [
+            self.btn_forward, self.btn_back, self.btn_left, self.btn_right, self.btn_up, self.btn_down,
+            self.btn_yaw_left, self.btn_yaw_right
+        ]
+
+        # Bind press/release để ramp khi ở Auto
+        self.btn_forward.bind("<ButtonPress-1>", self._forward_press)
+        self.btn_forward.bind("<ButtonRelease-1>", self._forward_release)
+        self.btn_back.bind("<ButtonPress-1>", self._back_press)
+        self.btn_back.bind("<ButtonRelease-1>", self._back_release)
+        self.btn_left.bind("<ButtonPress-1>", self._left_press)
+        self.btn_left.bind("<ButtonRelease-1>", self._left_release)
+        self.btn_right.bind("<ButtonPress-1>", self._right_press)
+        self.btn_right.bind("<ButtonRelease-1>", self._right_release)
+        self.btn_yaw_left.bind("<ButtonPress-1>", self._yaw_left_press)
+        self.btn_yaw_left.bind("<ButtonRelease-1>", self._yaw_left_release)
+        self.btn_yaw_right.bind("<ButtonPress-1>", self._yaw_right_press)
+        self.btn_yaw_right.bind("<ButtonRelease-1>", self._yaw_right_release)
 
         # ===== 3) Control Parameters =====
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
@@ -405,7 +432,7 @@ class App(tk.Tk):
         telem.grid_columnconfigure(0, weight=0)
         telem.grid_columnconfigure(1, weight=1)
 
-        # ===== 4) Logs (Compact) =====
+        # ===== 4) Logs =====
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(right, text="Logs", style="Section.TLabel").pack(anchor="w", pady=(0,4))
         log_holder = ttk.Frame(right, height=110)
@@ -428,12 +455,22 @@ class App(tk.Tk):
 
     # ---------- Logic ----------
     def toggle_forward(self):
-        s = self.gp.state
-        self.gp.state = ForwardState.ON if s == ForwardState.ARMING \
-                        else (ForwardState.ARMING if s == ForwardState.OFF else ForwardState.OFF)
+        # Cycle: Manual (ON) -> Auto (OFF) -> Arming -> Manual (ON)
+        prev = self.gp.state
+        self.gp.state = ForwardState.ON if prev == ForwardState.ARMING \
+                        else (ForwardState.ARMING if prev == ForwardState.OFF else ForwardState.OFF)
         self.state_var.set(f"Flight Mode: {self.gp.state}")
         self._update_flight_mode_controls()
         self.log(f"Flight Mode -> {self.gp.state}")
+
+        # Rời Auto -> (Arming|Manual): dừng ramp, KHÔNG reset giá trị
+        if prev == ForwardState.OFF and self.gp.state in (ForwardState.ARMING, ForwardState.ON):
+            self._stop_ramp()
+
+        # Vào Auto: chụp LY hiện tại để giữ nguyên trong Auto
+        if self.gp.state == ForwardState.OFF:
+            self.auto_ly_hold = float(self.gp.v_ly)
+            self.log(f"Auto mode: hold LY = {self.auto_ly_hold:+.3f}")
 
     def toggle_bboxes(self):
         if self.show_boxes and self.lock_target:
@@ -482,7 +519,7 @@ class App(tk.Tk):
             self.lock_signature = None
         self._update_target_controls_state()
 
-    # Selection handlers (blocked when OD off or Lock on)
+    # --- Selection handlers ---
     def on_key_s(self):
         if not self.show_boxes:
             self.log("Blocked: Object Detection is OFF (S)")
@@ -581,6 +618,128 @@ class App(tk.Tk):
         if not self._flight_cmd_guard("down"): return
         self.log("Flight command: down")
 
+    # ----- Ramp helpers (Forward/Back -> RY, Left/Right -> RX, Yaw L/R -> LX) when in Auto -----
+    def _forward_press(self, *_):
+        if not self._flight_cmd_guard("forward"): return
+        self._forward_holding = True
+        self._start_ramp_loop()
+
+    def _forward_release(self, *_):
+        self._forward_holding = False
+        self._start_ramp_loop()
+
+    def _back_press(self, *_):
+        if not self._flight_cmd_guard("back"): return
+        self._back_holding = True
+        self._start_ramp_loop()
+
+    def _back_release(self, *_):
+        self._back_holding = False
+        self._start_ramp_loop()
+
+    def _left_press(self, *_):
+        if not self._flight_cmd_guard("left"): return
+        self._left_holding = True
+        self._start_ramp_loop()
+
+    def _left_release(self, *_):
+        self._left_holding = False
+        self._start_ramp_loop()
+
+    def _right_press(self, *_):
+        if not self._flight_cmd_guard("right"): return
+        self._right_holding = True
+        self._start_ramp_loop()
+
+    def _right_release(self, *_):
+        self._right_holding = False
+        self._start_ramp_loop()
+
+    def _yaw_left_press(self, *_):
+        if not self._flight_cmd_guard("yaw left"): return
+        self._yaw_left_holding = True
+        self._start_ramp_loop()
+
+    def _yaw_left_release(self, *_):
+        self._yaw_left_holding = False
+        self._start_ramp_loop()
+
+    def _yaw_right_press(self, *_):
+        if not self._flight_cmd_guard("yaw right"): return
+        self._yaw_right_holding = True
+        self._start_ramp_loop()
+
+    def _yaw_right_release(self, *_):
+        self._yaw_right_holding = False
+        self._start_ramp_loop()
+
+    def _stop_ramp(self):
+        if self._ramp_job is not None:
+            try:
+                self.after_cancel(self._ramp_job)
+            except Exception:
+                pass
+            self._ramp_job = None
+
+    def _start_ramp_loop(self):
+        if self._ramp_job is None and self.gp.state == ForwardState.OFF:
+            self._ramp_job = self.after(33, self._ramp_tick)
+
+    def _ramp_tick(self):
+        self._ramp_job = None
+        if self.gp.state != ForwardState.OFF:
+            return
+
+        # ----- Targets -----
+        # RY: Forward(+), Back(-), both/none -> 0
+        if self._forward_holding and not self._back_holding:
+            target_ry = +self.RY_CAP
+        elif self._back_holding and not self._forward_holding:
+            target_ry = -self.RY_CAP
+        else:
+            target_ry = 0.0
+
+        # RX: Right(+), Left(-), both/none -> 0
+        if self._right_holding and not self._left_holding:
+            target_rx = +self.RX_CAP
+        elif self._left_holding and not self._right_holding:
+            target_rx = -self.RX_CAP
+        else:
+            target_rx = 0.0
+
+        # LX (Yaw): YawRight(+), YawLeft(-), both/none -> 0
+        if self._yaw_right_holding and not self._yaw_left_holding:
+            target_lx = +self.LX_CAP
+        elif self._yaw_left_holding and not self._yaw_right_holding:
+            target_lx = -self.LX_CAP
+        else:
+            target_lx = 0.0
+
+        # ----- Ramp current toward targets -----
+        # RY
+        if self.auto_ry < target_ry:
+            self.auto_ry = min(target_ry, self.auto_ry + self.RY_STEP)
+        elif self.auto_ry > target_ry:
+            self.auto_ry = max(target_ry, self.auto_ry - self.RY_STEP)
+        # RX
+        if self.auto_rx < target_rx:
+            self.auto_rx = min(target_rx, self.auto_rx + self.RX_STEP)
+        elif self.auto_rx > target_rx:
+            self.auto_rx = max(target_rx, self.auto_rx - self.RX_STEP)
+        # LX
+        if self.auto_lx < target_lx:
+            self.auto_lx = min(target_lx, self.auto_lx + self.LX_STEP)
+        elif self.auto_lx > target_lx:
+            self.auto_lx = max(target_lx, self.auto_lx - self.LX_STEP)
+
+        need_more = (
+            (abs(self.auto_ry - target_ry) > 1e-6) or self._forward_holding or self._back_holding or
+            (abs(self.auto_rx - target_rx) > 1e-6) or self._left_holding   or self._right_holding or
+            (abs(self.auto_lx - target_lx) > 1e-6) or self._yaw_left_holding or self._yaw_right_holding
+        )
+        if need_more:
+            self._ramp_job = self.after(33, self._ramp_tick)
+
     def _loop_worker(self):
         gen = self.model.track(source=CAM_INDEX, conf=CONF_THRES,
                                device="cuda" if USE_GPU else "cpu",
@@ -600,10 +759,9 @@ class App(tk.Tk):
                     for i in range(min(len(ids), len(clss))):
                         self.last_tracks[int(ids[i])] = int(clss[i])
 
-            # cập nhật danh sách ID theo filter hiện tại
             self._rebuild_available_ids()
 
-            # Reacquire / Restore theo filter
+            # Reacquire theo Lock
             if self.lock_target and self.lock_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.lock_signature
                 cond_in_filter = (self.display_allowed is None) or (sig_cls_id in self.display_allowed)
@@ -612,6 +770,7 @@ class App(tk.Tk):
                     self.reselect_signature = (sig_id, sig_cls_id, sig_cls_name)
                     self.log(f"Reacquired locked target ID={sig_id} class={sig_cls_name}")
 
+            # Restore theo reselect_signature
             if (not self.lock_target) and self.reselect_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.reselect_signature
                 cond_in_filter = (self.display_allowed is None) or (sig_cls_id in self.display_allowed)
@@ -637,6 +796,7 @@ class App(tk.Tk):
             elif self.gp.state == ForwardState.ON:
                 self.gp.send_to_virtual(r_lx,r_ly,r_rx,r_ry)
 
+            # cập nhật frame
             frame = res.orig_img.copy()
             frame = draw_tracks(frame, res, self.selected_id, self.names,
                                 show=self.show_boxes, allowed_classes=self.display_allowed)
@@ -655,9 +815,18 @@ class App(tk.Tk):
         self.state_var.set(f"Flight Mode: {self.gp.state}")
         self._update_flight_mode_controls()
         self.pad_name_var.set(self.gp.pad_name)
+
         vals = [self.gp.r_lx, self.gp.r_ly, self.gp.r_rx, self.gp.r_ry]
         for var, v in zip(self.real_vars, vals):
             var.set(f"{v:+.3f}")
+
+        # Ở Auto: LY giữ snapshot; LX/RX/RY theo ramp
+        if self.gp.state == ForwardState.OFF:
+            ry_float = max(-self.RY_CAP, min(self.RY_CAP, self.auto_ry))
+            rx_float = max(-self.RX_CAP, min(self.RX_CAP, self.auto_rx))
+            lx_float = max(-self.LX_CAP, min(self.LX_CAP, self.auto_lx))
+            self.gp.send_to_virtual(lx_float, self.auto_ly_hold, rx_float, ry_float)
+
         vals = [self.gp.v_lx, self.gp.v_ly, self.gp.v_rx, self.gp.v_ry]
         for var, v in zip(self.virt_vars, vals):
             var.set(f"{v:+.3f}")

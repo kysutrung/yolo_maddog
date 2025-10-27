@@ -29,7 +29,8 @@ except ImportError:
 WEIGHTS        = "yolo_weights/yolov8n.pt"
 USE_GPU        = True
 CONF_THRES     = 0.30
-CLASSES        = [0, 39]
+# Chỉ quét 3 lớp: person(0), car(2), motorcycle(3)
+CLASSES        = [0, 2, 3]
 TRACKER_CFG    = "bytetrack.yaml"
 PERSIST_ID     = True
 SAVE_OUTPUT    = False
@@ -53,7 +54,10 @@ class ForwardState:
     # NOTE: naming kept for backward compatibility vs existing logic
     OFF, ARMING, ON = "Auto", "Arming", "Manual"
 
-def draw_tracks(frame, res, selected_id, names, show=True):
+def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None):
+    """
+    allowed_classes: None => không lọc, hoặc set/list các class id cho phép hiển thị.
+    """
     if not show:
         return frame
     if res.boxes is None or len(res.boxes) == 0:
@@ -63,8 +67,13 @@ def draw_tracks(frame, res, selected_id, names, show=True):
     ids  = boxes.id.detach().cpu().numpy().astype(int) if boxes.id is not None else None
     clss = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else np.zeros(len(xyxy), dtype=int)
     confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy))
+
     for i, (x1, y1, x2, y2) in enumerate(xyxy):
         cls_i = int(clss[i]) if i < len(clss) else 0
+        # Lọc hiển thị theo combobox
+        if (allowed_classes is not None) and (cls_i not in allowed_classes):
+            continue
+
         label = names.get(cls_i, str(cls_i)) if isinstance(names, dict) else str(cls_i)
         track_id = int(ids[i]) if ids is not None and i < len(ids) else -1
         color, thick = ((0,0,255),3) if selected_id == track_id else ((0,255,0),2)
@@ -170,13 +179,18 @@ class App(tk.Tk):
         self.lock_target = False
         self.lock_btn_var = tk.StringVar(value="Target Lock: OFF")
 
+        # --- Lọc hiển thị theo Combobox ---
+        # None = All; {0} person; {2} car; {3} motorcycle
+        self.filter_var = tk.StringVar(value="All")
+        self.display_allowed = None  # None => All
+
         # Flight Mode buttons (enable only in Auto)
         self._flight_btns = []
 
-        # Lock signature (for hard lock) and reselect signature (for auto-restore without lock)
+        # Signatures
         self.lock_signature = None
         self.reselect_signature = None
-        self.last_tracks = {}
+        self.last_tracks = {}   # id -> cls_id
 
         # log queue
         self.log_queue = queue.Queue()
@@ -237,6 +251,41 @@ class App(tk.Tk):
         for b in self._flight_btns:
             b.configure(state=state)
 
+    # ---------- Filter helpers ----------
+    def _filter_label_to_allowed(self, label: str):
+        label = (label or "").strip().lower()
+        if label in ("all", "tất cả"):
+            return None
+        if label in ("person", "người"):
+            return {0}
+        if label in ("car", "xe ô tô", "oto", "ô tô"):
+            return {2}
+        if label in ("motorcycle", "xe máy", "xe may", "motorbike"):
+            return {3}
+        # default: All
+        return None
+
+    def _rebuild_available_ids(self):
+        """Cập nhật available_ids theo bộ lọc hiển thị hiện tại."""
+        if self.display_allowed is None:
+            self.available_ids = sorted(self.last_tracks.keys())
+        else:
+            self.available_ids = sorted([tid for tid, cls in self.last_tracks.items() if cls in self.display_allowed])
+
+        # nếu selection hiện tại không thuộc filter => bỏ chọn
+        if self.selected_id is not None:
+            if self.selected_id not in self.available_ids:
+                self.log(f"Current target ID={self.selected_id} is hidden by filter -> deselect")
+                self.selected_id = None
+                # giữ reselect_signature để có thể khôi phục nếu đổi filter lại
+        self._update_target_controls_state()
+
+    def on_filter_change(self, *_):
+        self.display_allowed = self._filter_label_to_allowed(self.filter_var.get())
+        human = self.filter_var.get()
+        self.log(f"Object filter -> {human}")
+        self._rebuild_available_ids()
+
     # ---------- UI ----------
     def _build_ui(self):
         root = ttk.Frame(self, padding=THEME_PAD)
@@ -272,6 +321,7 @@ class App(tk.Tk):
         tc.grid_columnconfigure(1, weight=1, uniform="tc")
         tc.grid_columnconfigure(2, weight=1, uniform="tc")
 
+        # --- Toggle OD / Lock ---
         toggles = ttk.Frame(right)
         toggles.pack(fill="x", pady=(0,6))
         self.btn_bbox = ttk.Button(toggles, textvariable=self.bbox_btn_var,
@@ -283,16 +333,28 @@ class App(tk.Tk):
         toggles.grid_columnconfigure(0, weight=1, uniform="tog")
         toggles.grid_columnconfigure(1, weight=1, uniform="tog")
 
+        # --- Combobox lọc object để hiển thị ---
+        filt_row = ttk.Frame(right)
+        filt_row.pack(fill="x", pady=(0,6))
+        ttk.Label(filt_row, text="Show:", style="Compact.TLabel", width=8).grid(row=0, column=0, sticky="w")
+        self.filter_combo = ttk.Combobox(
+            filt_row,
+            textvariable=self.filter_var,
+            values=["All", "Person", "Car", "Motorcycle"],
+            state="readonly",
+            width=18
+        )
+        self.filter_combo.grid(row=0, column=1, sticky="ew")
+        filt_row.grid_columnconfigure(1, weight=1)
+        self.filter_combo.bind("<<ComboboxSelected>>", self.on_filter_change)
+
         # ===== 2) Flight Mode =====
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         self.state_var = tk.StringVar(value=f"Flight Mode: {self.gp.state}")
         ttk.Label(right, textvariable=self.state_var, style="Section.TLabel").pack(anchor="w", pady=(0,4))
-
-        # ---- Switch Mode button ABOVE the 6 direction buttons ----
         ttk.Button(right, text="Switch Mode", command=self.toggle_forward,
                    style="Compact.TButton").pack(fill="x", pady=(0,6))
 
-        # 6 mini buttons (enabled only when Auto)
         fm = ttk.Frame(right)
         fm.pack(fill="x", pady=(0,6))
         mk = lambda t, cmd: ttk.Button(fm, text=t, command=cmd, style="Flight.TButton", width=10)
@@ -310,10 +372,8 @@ class App(tk.Tk):
         self.btn_left.grid(   row=1, column=0, padx=(0,4), sticky="ew")
         self.btn_right.grid(  row=1, column=1, padx=4,     sticky="ew")
         self.btn_down.grid(   row=1, column=2, padx=(4,0), sticky="ew")
-
         for c in range(3):
             fm.grid_columnconfigure(c, weight=1, uniform="fm")
-
         self._flight_btns = [self.btn_forward, self.btn_back, self.btn_left, self.btn_right, self.btn_up, self.btn_down]
 
         # ===== 3) Control Parameters =====
@@ -345,16 +405,7 @@ class App(tk.Tk):
         telem.grid_columnconfigure(0, weight=0)
         telem.grid_columnconfigure(1, weight=1)
 
-        # ===== 4) Shortcuts =====
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(
-            right,
-            text="ESC: Quit | S: select/clear | A/D: prev/next | Toggles: OD / Lock",
-            style="Compact.TLabel",
-            wraplength=RIGHT_PANEL_W-16, justify="left"
-        ).pack(anchor="w")
-
-        # ===== 5) Logs (Compact) =====
+        # ===== 4) Logs (Compact) =====
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(right, text="Logs", style="Section.TLabel").pack(anchor="w", pady=(0,4))
         log_holder = ttk.Frame(right, height=110)
@@ -365,6 +416,15 @@ class App(tk.Tk):
         log_scroll = ttk.Scrollbar(log_holder, orient="vertical", command=self.log_text.yview)
         log_scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        # ===== 5) Shortcuts =====
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(
+            right,
+            text="ESC: Quit | S: select/clear | A/D: prev/next | Toggles: OD / Lock",
+            style="Compact.TLabel",
+            wraplength=RIGHT_PANEL_W-16, justify="left"
+        ).pack(anchor="w")
 
     # ---------- Logic ----------
     def toggle_forward(self):
@@ -431,18 +491,18 @@ class App(tk.Tk):
         if self.lock_target:
             self.log("Blocked: Target Lock is active (S)")
             return
-        if self.selected_id is None:
-            self.selected_id = self.available_ids[0] if self.available_ids else None
-            if self.selected_id is not None:
+        if self.available_ids:
+            if self.selected_id is None:
+                self.selected_id = self.available_ids[0]
                 cls_id, cls_name = self._get_class_for_id(self.selected_id)
                 self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
                 self.log(f"Selected target ID={self.selected_id}")
             else:
-                self.log("No available targets to select")
+                self.log("Target deselected")
+                self.selected_id = None
+                self.reselect_signature = None
         else:
-            self.log("Target deselected")
-            self.selected_id = None
-            self.reselect_signature = None
+            self.log("No available targets to select")
 
     def on_key_d(self):
         if not self.show_boxes:
@@ -540,25 +600,27 @@ class App(tk.Tk):
                     for i in range(min(len(ids), len(clss))):
                         self.last_tracks[int(ids[i])] = int(clss[i])
 
-            frame = res.orig_img.copy()
-            self.available_ids = sorted(self.last_tracks.keys())
+            # cập nhật danh sách ID theo filter hiện tại
+            self._rebuild_available_ids()
 
-            # Reacquire logic
+            # Reacquire / Restore theo filter
             if self.lock_target and self.lock_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.lock_signature
-                if sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
+                cond_in_filter = (self.display_allowed is None) or (sig_cls_id in self.display_allowed)
+                if cond_in_filter and sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
                     self.selected_id = sig_id
                     self.reselect_signature = (sig_id, sig_cls_id, sig_cls_name)
                     self.log(f"Reacquired locked target ID={sig_id} class={sig_cls_name}")
 
             if (not self.lock_target) and self.reselect_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.reselect_signature
-                if sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
+                cond_in_filter = (self.display_allowed is None) or (sig_cls_id in self.display_allowed)
+                if cond_in_filter and sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
                     self.selected_id = sig_id
                     self.log(f"Restored selection for target ID={sig_id} class={sig_cls_name}")
 
             if self.selected_id is not None and self.selected_id not in self.available_ids:
-                self.log(f"Lost target ID={self.selected_id} (out of view)")
+                self.log(f"Lost/hidden target ID={self.selected_id}")
                 cls_id, cls_name = self._get_class_for_id(self.selected_id)
                 if cls_id is not None:
                     self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name))
@@ -575,7 +637,9 @@ class App(tk.Tk):
             elif self.gp.state == ForwardState.ON:
                 self.gp.send_to_virtual(r_lx,r_ly,r_rx,r_ry)
 
-            frame = draw_tracks(frame, res, self.selected_id, self.names, show=self.show_boxes)
+            frame = res.orig_img.copy()
+            frame = draw_tracks(frame, res, self.selected_id, self.names,
+                                show=self.show_boxes, allowed_classes=self.display_allowed)
             fixed = resize_with_letterbox(frame, VIDEO_W, VIDEO_H)
             with self.frame_lock:
                 self.latest_bgr = fixed

@@ -1,5 +1,7 @@
-# yolo_gamepad_forward_tk_spacer.py
-# GUI with flexible spacing and compact log panel (English version, compact controls + restore selection on reappear + Flight Mode buttons)
+# yolo_gamepad_forward_tk_spacer_enhanced_crosshair_auto_follow_navhold_downback.py
+# GUI with enhanced persistent tracking + center/target crosshair
+# Target Follow ONLY in Auto; Auto-hold Yaw+Lateral (Left/Right) and Backward (when Down) based on NAV CMD for up to 1s
+# pip install ultralytics opencv-python numpy pillow pygame vgamepad
 
 import os
 import cv2
@@ -11,6 +13,7 @@ from tkinter import ttk
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 import queue
+import time  # timers
 
 # -------- Optional dependencies --------
 try:
@@ -48,23 +51,36 @@ RIGHT_PANEL_W    = 320
 THEME_PAD        = 10
 # =====================================================
 
+# ======== Enhanced Follow config ========
+PRED_MAX_GAP        = 12     # số frame dự đoán tối đa trước khi bỏ
+REACQ_IOU_THR       = 0.32   # ngưỡng IoU cho re-acquire quanh vị trí dự đoán/track
+HIST_SIM_THR        = 0.50   # 0..1 (cosine) -> xác nhận appearance
+USE_CV_TRACKER      = True   # bật bộ theo dõi OpenCV làm cầu nối
+CV_TRACKER_TYPE     = "CSRT" # CSRT/KCF/MOSSE
+MIN_AREA_REACQ      = 400    # bỏ qua box quá nhỏ khi re-acquire
+# =====================================================
+
+# ======== Navigation without on-frame text ========
+NAV_DEAD_ZONE_PX      = 20     # vùng chết tính trên frame gốc
+CROSSHAIR_CENTER_SIZE = 8
+CROSSHAIR_TARGET_SIZE = 6
+# =====================================================
+
 def dz(v, d=DEADZONE): return 0.0 if abs(v) < d else v
 
 class ForwardState:
-    # giữ tên cũ để tương thích
+    # Giữ tên cũ: OFF = "Auto"
     OFF, ARMING, ON = "Auto", "Arming", "Manual"
 
+# ================== Drawing helpers ==================
 def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None):
-    if not show:
-        return frame
-    if res.boxes is None or len(res.boxes) == 0:
+    if not show or res.boxes is None or len(res.boxes) == 0:
         return frame
     boxes = res.boxes
     xyxy = boxes.xyxy.detach().cpu().numpy().astype(int)
     ids  = boxes.id.detach().cpu().numpy().astype(int) if boxes.id is not None else None
     clss = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else np.zeros(len(xyxy), dtype=int)
     confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy))
-
     for i, (x1, y1, x2, y2) in enumerate(xyxy):
         cls_i = int(clss[i]) if i < len(clss) else 0
         if (allowed_classes is not None) and (cls_i not in allowed_classes):
@@ -77,9 +93,30 @@ def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None)
         (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         y_text = max(0, y1-8)
         cv2.rectangle(frame,(x1,y_text-th-6),(x1+tw+6,y_text+2),(0,0,0),-1)
-        cv2.putText(frame, txt, (x1+3,y_text), cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2,cv2.LINE_AA)
+        cv2.putText(frame, txt, (x1+3,y_text), cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),2, cv2.LINE_AA)
     return frame
 
+def draw_predicted_box(frame, box, label="PRED", color=(255, 200, 0)):
+    if box is None: return frame
+    x1,y1,x2,y2 = map(int, box)
+    cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+    cv2.rectangle(frame, (x1, max(0,y1-22)), (x1+90, max(0,y1-2)), (0,0,0), -1)
+    cv2.putText(frame, label, (x1+4, max(10,y1-6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2, cv2.LINE_AA)
+    return frame
+
+def draw_crosshair_center(frame, size=CROSSHAIR_CENTER_SIZE, color=(255, 0, 0)):
+    h, w = frame.shape[:2]
+    cx, cy = w // 2, h // 2
+    cv2.line(frame, (cx - size, cy), (cx + size, cy), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - size), (cx, cy + size), color, 1, cv2.LINE_AA)
+
+def draw_crosshair_at(frame, x, y, size=CROSSHAIR_TARGET_SIZE, color=(0, 255, 255)):
+    x, y = int(x), int(y)
+    cv2.line(frame, (x - size, y), (x + size, y), color, 1, cv2.LINE_AA)
+    cv2.line(frame, (x, y - size), (x, y + size), color, 1, cv2.LINE_AA)
+
+# ================== Math & utility ==================
 def next_higher(lst, cur): return next((x for x in lst if x > cur), None)
 def next_lower(lst, cur):
     prev = None
@@ -99,6 +136,100 @@ def resize_with_letterbox(bgr, target_w, target_h):
     canvas[y:y+new_h, x:x+new_w] = resized
     return canvas
 
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def box_center(x1,y1,x2,y2): return (0.5*(x1+x2), 0.5*(y1+y2))
+
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0: return 0.0
+    area_a = max(0, ax2-ax1) * max(0, ay2-ay1)
+    area_b = max(0, bx2-bx1) * max(0, by2-by1)
+    union = area_a + area_b - inter + 1e-9
+    return inter / union
+
+def clip_box_to_frame(b, W, H):
+    x1,y1,x2,y2 = b
+    return (clamp(int(x1),0,W-1), clamp(int(y1),0,H-1),
+            clamp(int(x2),0,W-1), clamp(int(y2),0,H-1))
+
+# =============== Appearance & CV Tracker helpers ===============
+def compute_hist(image, bbox_xyxy):
+    x1, y1, x2, y2 = [max(0, int(v)) for v in bbox_xyxy]
+    x2 = min(x2, image.shape[1]); y2 = min(y2, image.shape[0])
+    if x2 <= x1 or y2 <= y1: return None
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0: return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0,1], None, [50,60], [0,180, 0,256])
+    cv2.normalize(hist, hist)
+    return hist.flatten()
+
+def cosine_sim(a, b):
+    if a is None or b is None: return 0.0
+    den = (np.linalg.norm(a) * np.linalg.norm(b))
+    if den <= 1e-9: return 0.0
+    return float(np.dot(a, b) / den)
+
+def make_cv_tracker(name=CV_TRACKER_TYPE):
+    legacy = getattr(cv2, "legacy", None)
+    n = (name or "CSRT").upper()
+    if n == "CSRT":
+        return legacy.TrackerCSRT_create() if legacy and hasattr(legacy,"TrackerCSRT_create") else cv2.TrackerCSRT_create()
+    if n == "KCF":
+        return legacy.TrackerKCF_create()  if legacy and hasattr(legacy,"TrackerKCF_create")  else cv2.TrackerKCF_create()
+    if n == "MOSSE":
+        return legacy.TrackerMOSSE_create() if legacy and hasattr(legacy,"TrackerMOSSE_create") else cv2.TrackerMOSSE_create()
+    return legacy.TrackerCSRT_create() if legacy and hasattr(legacy,"TrackerCSRT_create") else cv2.TrackerCSRT_create()
+
+# ================== Gap Predictor ==================
+class GapPredictor:
+    def __init__(self, frame_size, max_gap=12, damping=0.88):
+        self.W, self.H = frame_size
+        self.max_gap = int(max_gap)
+        self.damping = float(damping)
+        self.reset()
+    def reset(self):
+        self.last_box = None
+        self.last_center = None
+        self.vel = (0.0, 0.0)
+        self.gap = 0
+        self.active = False
+    def update_with_detection(self, box_xyxy):
+        x1,y1,x2,y2 = map(float, box_xyxy)
+        c = box_center(x1,y1,x2,y2)
+        if self.last_center is not None:
+            vx = c[0] - self.last_center[0]
+            vy = c[1] - self.last_center[1]
+            self.vel = (0.6*vx + 0.4*self.vel[0], 0.6*vy + 0.4*self.vel[1])
+        self.last_box = (x1,y1,x2,y2)
+        self.last_center = c
+        self.gap = 0
+        self.active = False
+    def predict_next(self):
+        if self.last_box is None: return None
+        if self.gap >= self.max_gap:
+            self.reset(); return None
+        vx, vy = self.vel
+        x1,y1,x2,y2 = self.last_box
+        grow = 1.0 + 0.008 * (self.gap + 1)
+        cx, cy = box_center(x1,y1,x2,y2)
+        w = (x2 - x1) * grow; h = (y2 - y1) * grow
+        cx, cy = cx + vx, cy + vy
+        nx1, ny1 = cx - w/2, cy - h/2
+        nx2, ny2 = cx + w/2, cy + h/2
+        nb = clip_box_to_frame((nx1,ny1,nx2,ny2), self.W, self.H)
+        self.vel = (0.88 * vx, 0.88 * vy)
+        self.last_box = nb
+        self.last_center = box_center(*nb)
+        self.gap += 1
+        self.active = True
+        return nb
+
+# ================== Gamepad bridge ==================
 class GamepadBridge:
     def __init__(self):
         self.pad_name = "N/A"; self.pygame_ok = self.vpad_ok = False
@@ -120,7 +251,6 @@ class GamepadBridge:
                 self.vpad = vg.VX360Gamepad(); self.vpad_ok = True
             except Exception as e:
                 print(e)
-
     def read_axes_real(self):
         if not self.pygame_ok:
             return (0,0,0,0)
@@ -134,15 +264,14 @@ class GamepadBridge:
             lx = ly = rx = ry = 0.0
         self.r_lx, self.r_ly, self.r_rx, self.r_ry = [max(-1,min(1,float(v))) for v in [lx,ly,rx,ry]]
         return self.r_lx, self.r_ly, self.r_rx, self.r_ry
-
     def send_to_virtual(self, lx, ly, rx, ry):
         self.v_lx, self.v_ly, self.v_rx, self.v_ry = lx, ly, rx, ry
-        if not self.vpad_ok:
-            return
+        if not self.vpad_ok: return
         self.vpad.left_joystick_float(lx, ly)
         self.vpad.right_joystick_float(rx, ry)
         self.vpad.update()
 
+# ================== App ==================
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -162,13 +291,13 @@ class App(tk.Tk):
         self.model = YOLO(WEIGHTS)
         self.names = self.model.model.names if hasattr(self.model, "model") else self.model.names
 
-        # trạng thái hiển thị & chọn mục tiêu
+        # hiển thị & chọn mục tiêu
         self.show_boxes = False
         self.bbox_btn_var = tk.StringVar(value="Object Detection: OFF")
         self.lock_target = False
         self.lock_btn_var = tk.StringVar(value="Target Lock: OFF")
 
-        # NEW: Target Follow state
+        # Target Follow
         self.target_follow = False
         self.follow_btn_var = tk.StringVar(value="Target Follow: OFF")
 
@@ -176,7 +305,7 @@ class App(tk.Tk):
         self.filter_var = tk.StringVar(value="All")
         self.display_allowed = None  # None => All
 
-        # flight buttons (chỉ enable khi Auto)
+        # flight buttons
         self._flight_btns = []
 
         # reselect / lock
@@ -191,17 +320,16 @@ class App(tk.Tk):
         self._init_styles()
 
         # ---- Auto ramp settings (LX, RX, RY) ----
-        # Có thể chỉnh riêng giới hạn & bước ramp cho từng trục
-        self.RY_CAP = 0.200; self.RY_STEP = 0.006
-        self.RX_CAP = 0.200; self.RX_STEP = 0.006
-        self.LX_CAP = 0.200; self.LX_STEP = 0.006
+        self.RY_CAP = 0.400; self.RY_STEP = 0.05
+        self.RX_CAP = 0.400; self.RX_STEP = 0.05
+        self.LX_CAP = 0.400; self.LX_STEP = 0.05
 
         # Giá trị hiện tại (Auto) gửi ra vgamepad
         self.auto_ry = 0.0
         self.auto_rx = 0.0
         self.auto_lx = 0.0
 
-        # Trạng thái giữ nút
+        # Ramp state (manual holds)
         self._ramp_job = None
         self._forward_holding = False
         self._back_holding    = False
@@ -210,8 +338,32 @@ class App(tk.Tk):
         self._yaw_left_holding  = False
         self._yaw_right_holding = False
 
+        # NEW: Auto-hold (from NAV CMD)
+        self._auto_left = False
+        self._auto_right = False
+        self._auto_yaw_left = False
+        self._auto_yaw_right = False
+        self._auto_back = False                # <-- NEW
+        self._nav_left_until = 0.0
+        self._nav_right_until = 0.0
+        self._nav_back_until = 0.0             # <-- NEW
+
         # giữ LY khi vào Auto
         self.auto_ly_hold = 0.0
+
+        # ===== Enhanced follow states =====
+        self.PRED_IOU_THR = REACQ_IOU_THR
+        self.PRED_MAX_GAP = PRED_MAX_GAP
+        self.pred = GapPredictor((VIDEO_W, VIDEO_H), max_gap=self.PRED_MAX_GAP, damping=0.88)
+        self.predicted_box = None
+
+        self.sel_hist = None
+        self.cv_tracker = None
+        self.hist_sim_thr = HIST_SIM_THR
+
+        # ===== Navigation (logs only) =====
+        self.nav_dead_zone_px = NAV_DEAD_ZONE_PX
+        self.last_nav_cmd = None  # tránh spam log
 
         self._build_ui()
 
@@ -243,20 +395,16 @@ class App(tk.Tk):
         self.log_queue.put(f"[{ts}] {message}\n")
 
     def _update_target_controls_state(self):
-        enabled = (self.show_boxes and not self.lock_target)
-        state = "normal" if enabled else "disabled"
+        enabled_select = (self.show_boxes and not self.lock_target)
         for b in (self.btn_prev, self.btn_select, self.btn_next):
-            b.configure(state=state)
-
-        # Enable/disable Target Follow button:
-        follow_enabled = (self.show_boxes and self.selected_id is not None)
+            b.configure(state=("normal" if enabled_select else "disabled"))
+        follow_enabled = (self.show_boxes and self.selected_id is not None and self.gp.state == ForwardState.OFF)
         self.btn_follow.configure(state=("normal" if follow_enabled else "disabled"))
 
     def _get_class_for_id(self, tid):
         if tid is None: return None, None
         cls_id = self.last_tracks.get(int(tid), None)
-        if cls_id is None:
-            return None, None
+        if cls_id is None: return None, None
         if isinstance(self.names, dict):
             cls_name = self.names.get(int(cls_id), str(cls_id))
         else:
@@ -268,18 +416,15 @@ class App(tk.Tk):
         state = "normal" if enable else "disabled"
         for b in self._flight_btns:
             b.configure(state=state)
+        self._update_target_controls_state()
 
     # ---------- Filter helpers ----------
     def _filter_label_to_allowed(self, label: str):
         label = (label or "").strip().lower()
-        if label in ("all", "tất cả"):
-            return None
-        if label in ("person", "người"):
-            return {0}
-        if label in ("car", "xe ô tô", "oto", "ô tô"):
-            return {2}
-        if label in ("motorcycle", "xe máy", "xe may", "motorbike"):
-            return {3}
+        if label in ("all", "tất cả"): return None
+        if label in ("person", "người"): return {0}
+        if label in ("car", "xe ô tô", "oto", "ô tô"): return {2}
+        if label in ("motorcycle", "xe máy", "xe may", "motorbike"): return {3}
         return None
 
     def _rebuild_available_ids(self):
@@ -290,6 +435,9 @@ class App(tk.Tk):
         if self.selected_id is not None and self.selected_id not in self.available_ids:
             self.log(f"Current target ID={self.selected_id} is hidden by filter -> deselect")
             self.selected_id = None
+            self.pred.reset(); self.predicted_box = None
+            self.cv_tracker = None; self.sel_hist = None
+            self.last_nav_cmd = None
         self._update_target_controls_state()
 
     def on_filter_change(self, *_):
@@ -384,7 +532,7 @@ class App(tk.Tk):
         self.btn_right.grid(  row=1, column=1, padx=4,     sticky="ew")
         self.btn_down.grid(   row=1, column=2, padx=(4,0), sticky="ew")
 
-        # Hàng mới: Yaw Left / Yaw Right
+        # Hàng mới: Yaw
         self.btn_yaw_left  = mk("Yaw Left",  lambda: None)
         self.btn_yaw_right = mk("Yaw Right", lambda: None)
         self.btn_yaw_left.grid( row=2, column=0, padx=(0,4), pady=(0,4), sticky="ew")
@@ -397,13 +545,11 @@ class App(tk.Tk):
             self.btn_yaw_left, self.btn_yaw_right
         ]
 
-        # === NEW: Spacer + Target Follow button (đặt NGAY BÊN DƯỚI cụm điều hướng) ===
-        ttk.Frame(right, height=8).pack(fill="x")  # khoảng cách nhỏ để tránh bấm nhầm
+        # === Target Follow button ===
+        ttk.Frame(right, height=8).pack(fill="x")
         self.btn_follow = ttk.Button(
-            right,
-            textvariable=self.follow_btn_var,
-            command=self.toggle_follow,
-            style="Compact.TButton"
+            right, textvariable=self.follow_btn_var,
+            command=self.toggle_follow, style="Compact.TButton"
         )
         self.btn_follow.pack(fill="x", pady=(0,6))
 
@@ -481,14 +627,32 @@ class App(tk.Tk):
         self._update_flight_mode_controls()
         self.log(f"Flight Mode -> {self.gp.state}")
 
-        # Rời Auto -> (Arming|Manual): dừng ramp, KHÔNG reset giá trị
+        # Rời Auto -> tắt Follow ngay + clear auto-hold
         if prev == ForwardState.OFF and self.gp.state in (ForwardState.ARMING, ForwardState.ON):
+            if self.target_follow:
+                self.target_follow = False
+                self.follow_btn_var.set("Target Follow: OFF")
+                self.log("Target Follow -> OFF (leaving Auto)")
+            self._clear_auto_holds()
             self._stop_ramp()
 
         # Vào Auto: chụp LY hiện tại để giữ nguyên trong Auto
         if self.gp.state == ForwardState.OFF:
             self.auto_ly_hold = float(self.gp.v_ly)
             self.log(f"Auto mode: hold LY = {self.auto_ly_hold:+.3f}")
+
+        self._update_target_controls_state()
+
+    def _clear_auto_holds(self):
+        changed = any([self._auto_left, self._auto_right, self._auto_yaw_left,
+                       self._auto_yaw_right, self._auto_back])
+        self._auto_left = self._auto_right = False
+        self._auto_yaw_left = self._auto_yaw_right = False
+        self._auto_back = False
+        self._nav_left_until = self._nav_right_until = 0.0
+        self._nav_back_until = 0.0
+        if changed:
+            self._start_ramp_loop()
 
     def toggle_bboxes(self):
         if self.show_boxes and self.lock_target:
@@ -504,11 +668,14 @@ class App(tk.Tk):
                 self.log(f"Object Detection turned OFF -> deselected ID={self.selected_id}")
             self.selected_id = None
             self.reselect_signature = None
-            # ALSO turn off Target Follow when OD is OFF
             if self.target_follow:
                 self.target_follow = False
                 self.follow_btn_var.set("Target Follow: OFF")
                 self.log("Target Follow -> OFF (Object Detection OFF)")
+            self.pred.reset(); self.predicted_box = None
+            self.cv_tracker = None; self.sel_hist = None
+            self.last_nav_cmd = None
+            self._clear_auto_holds()
             self.log("No target is currently selected")
         self._update_target_controls_state()
 
@@ -542,8 +709,14 @@ class App(tk.Tk):
             self.lock_signature = None
         self._update_target_controls_state()
 
-    # NEW: Target Follow toggle
     def toggle_follow(self):
+        # Chỉ cho phép khi Flight Mode = Auto (OFF)
+        if self.gp.state != ForwardState.OFF:
+            self.target_follow = False
+            self.follow_btn_var.set("Target Follow: OFF")
+            self.log("Blocked: Target Follow requires Flight Mode = Auto")
+            self._update_target_controls_state()
+            return
         if not self.show_boxes:
             self.target_follow = False
             self.follow_btn_var.set("Target Follow: OFF")
@@ -561,12 +734,12 @@ class App(tk.Tk):
         self.follow_btn_var.set(f"Target Follow: {'ON' if self.target_follow else 'OFF'}")
         if self.target_follow:
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
-            if cls_name is not None:
-                self.log(f"Target Follow -> ON (ID={self.selected_id}, class={cls_name})")
-            else:
-                self.log(f"Target Follow -> ON (ID={self.selected_id})")
+            self.log(f"Target Follow -> ON (ID={self.selected_id}{', class='+str(cls_name) if cls_name else ''})")
+            self.last_nav_cmd = None
         else:
             self.log("Target Follow -> OFF")
+            self.last_nav_cmd = None
+            self._clear_auto_holds()
 
     # --- Selection handlers ---
     def on_key_s(self):
@@ -583,15 +756,19 @@ class App(tk.Tk):
                 cls_id, cls_name = self._get_class_for_id(self.selected_id)
                 self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
                 self.log(f"Selected target ID={self.selected_id}")
+                self.last_nav_cmd = None
             else:
                 self.log("Target deselected")
                 self.selected_id = None
                 self.reselect_signature = None
-                # If following, turn off since no selection
                 if self.target_follow:
                     self.target_follow = False
                     self.follow_btn_var.set("Target Follow: OFF")
                     self.log("Target Follow -> OFF (no target selected)")
+                self.pred.reset(); self.predicted_box = None
+                self.cv_tracker = None; self.sel_hist = None
+                self.last_nav_cmd = None
+                self._clear_auto_holds()
         else:
             self.log("No available targets to select")
         self._update_target_controls_state()
@@ -616,6 +793,8 @@ class App(tk.Tk):
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
             self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
             self.log(f"Selected target ID={self.selected_id}")
+            self.last_nav_cmd = None
+            self._clear_auto_holds()
         else:
             self.log("No available targets")
         self._update_target_controls_state()
@@ -640,6 +819,8 @@ class App(tk.Tk):
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
             self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
             self.log(f"Selected target ID={self.selected_id}")
+            self.last_nav_cmd = None
+            self._clear_auto_holds()
         else:
             self.log("No available targets")
         self._update_target_controls_state()
@@ -650,92 +831,61 @@ class App(tk.Tk):
             self.log(f"Ignored ({name}): Flight Mode is not Auto")
             return False
         return True
-
     def cmd_forward(self):
         if not self._flight_cmd_guard("forward"): return
         self.log("Flight command: forward")
-
     def cmd_back(self):
         if not self._flight_cmd_guard("back"): return
         self.log("Flight command: back")
-
     def cmd_left(self):
         if not self._flight_cmd_guard("left"): return
         self.log("Flight command: left")
-
     def cmd_right(self):
         if not self._flight_cmd_guard("right"): return
         self.log("Flight command: right")
-
     def cmd_up(self):
         if not self._flight_cmd_guard("up"): return
         self.log("Flight command: up")
-
     def cmd_down(self):
         if not self._flight_cmd_guard("down"): return
         self.log("Flight command: down")
 
-    # ----- Ramp helpers (Forward/Back -> RY, Left/Right -> RX, Yaw L/R -> LX) when in Auto -----
+    # ----- Ramp helpers (manual) -----
     def _forward_press(self, *_):
         if not self._flight_cmd_guard("forward"): return
-        self._forward_holding = True
-        self._start_ramp_loop()
-
+        self._forward_holding = True; self._start_ramp_loop()
     def _forward_release(self, *_):
-        self._forward_holding = False
-        self._start_ramp_loop()
-
+        self._forward_holding = False; self._start_ramp_loop()
     def _back_press(self, *_):
         if not self._flight_cmd_guard("back"): return
-        self._back_holding = True
-        self._start_ramp_loop()
-
+        self._back_holding = True; self._start_ramp_loop()
     def _back_release(self, *_):
-        self._back_holding = False
-        self._start_ramp_loop()
-
+        self._back_holding = False; self._start_ramp_loop()
     def _left_press(self, *_):
         if not self._flight_cmd_guard("left"): return
-        self._left_holding = True
-        self._start_ramp_loop()
-
+        self._left_holding = True; self._start_ramp_loop()
     def _left_release(self, *_):
-        self._left_holding = False
-        self._start_ramp_loop()
-
+        self._left_holding = False; self._start_ramp_loop()
     def _right_press(self, *_):
         if not self._flight_cmd_guard("right"): return
-        self._right_holding = True
-        self._start_ramp_loop()
-
+        self._right_holding = True; self._start_ramp_loop()
     def _right_release(self, *_):
-        self._right_holding = False
-        self._start_ramp_loop()
-
+        self._right_holding = False; self._start_ramp_loop()
     def _yaw_left_press(self, *_):
         if not self._flight_cmd_guard("yaw left"): return
-        self._yaw_left_holding = True
-        self._start_ramp_loop()
-
+        self._yaw_left_holding = True; self._start_ramp_loop()
     def _yaw_left_release(self, *_):
-        self._yaw_left_holding = False
-        self._start_ramp_loop()
-
+        self._yaw_left_holding = False; self._start_ramp_loop()
     def _yaw_right_press(self, *_):
         if not self._flight_cmd_guard("yaw right"): return
-        self._yaw_right_holding = True
-        self._start_ramp_loop()
-
+        self._yaw_right_holding = True; self._start_ramp_loop()
     def _yaw_right_release(self, *_):
-        self._yaw_right_holding = False
-        self._start_ramp_loop()
+        self._yaw_right_holding = False; self._start_ramp_loop()
 
     def _stop_ramp(self):
         if self._ramp_job is not None:
-            try:
-                self.after_cancel(self._ramp_job)
-            except Exception:
-                pass
+            try: self.after_cancel(self._ramp_job)
+            except Exception: pass
             self._ramp_job = None
 
     def _start_ramp_loop(self):
@@ -747,55 +897,106 @@ class App(tk.Tk):
         if self.gp.state != ForwardState.OFF:
             return
 
-        # ----- Targets -----
-        # RY: Forward(+), Back(-), both/none -> 0
-        if self._forward_holding and not self._back_holding:
-            target_ry = +self.RY_CAP
-        elif self._back_holding and not self._forward_holding:
-            target_ry = -self.RY_CAP
-        else:
-            target_ry = 0.0
+        # ===== Combine manual + auto-hold flags =====
+        right_eff = self._right_holding or self._auto_right
+        left_eff  = self._left_holding  or self._auto_left
+        yaw_r_eff = self._yaw_right_holding or self._auto_yaw_right
+        yaw_l_eff = self._yaw_left_holding  or self._auto_yaw_left
+        back_eff  = self._back_holding or self._auto_back   # <-- NEW
 
-        # RX: Right(+), Left(-), both/none -> 0
-        if self._right_holding and not self._left_holding:
-            target_rx = +self.RX_CAP
-        elif self._left_holding and not self._right_holding:
-            target_rx = -self.RX_CAP
-        else:
-            target_rx = 0.0
+        # Targets
+        if right_eff and not left_eff:     target_rx = +self.RX_CAP
+        elif left_eff and not right_eff:   target_rx = -self.RX_CAP
+        else:                              target_rx = 0.0
 
-        # LX (Yaw): YawRight(+), YawLeft(-), both/none -> 0
-        if self._yaw_right_holding and not self._yaw_left_holding:
-            target_lx = +self.LX_CAP
-        elif self._yaw_left_holding and not self._yaw_right_holding:
-            target_lx = -self.LX_CAP
-        else:
-            target_lx = 0.0
+        if yaw_r_eff and not yaw_l_eff:    target_lx = +self.LX_CAP
+        elif yaw_l_eff and not yaw_r_eff:  target_lx = -self.LX_CAP
+        else:                              target_lx = 0.0
 
-        # ----- Ramp current toward targets -----
-        # RY
-        if self.auto_ry < target_ry:
-            self.auto_ry = min(target_ry, self.auto_ry + self.RY_STEP)
-        elif self.auto_ry > target_ry:
-            self.auto_ry = max(target_ry, self.auto_ry - self.RY_STEP)
-        # RX
-        if self.auto_rx < target_rx:
-            self.auto_rx = min(target_rx, self.auto_rx + self.RX_STEP)
-        elif self.auto_rx > target_rx:
-            self.auto_rx = max(target_rx, self.auto_rx - self.RX_STEP)
-        # LX
-        if self.auto_lx < target_lx:
-            self.auto_lx = min(target_lx, self.auto_lx + self.LX_STEP)
-        elif self.auto_lx > target_lx:
-            self.auto_lx = max(target_lx, self.auto_lx - self.LX_STEP)
+        if self._forward_holding and not back_eff:   target_ry = +self.RY_CAP
+        elif back_eff and not self._forward_holding: target_ry = -self.RY_CAP
+        else:                                        target_ry = 0.0
+
+        # Ramp
+        if self.auto_ry < target_ry: self.auto_ry = min(target_ry, self.auto_ry + self.RY_STEP)
+        elif self.auto_ry > target_ry: self.auto_ry = max(target_ry, self.auto_ry - self.RY_STEP)
+
+        if self.auto_rx < target_rx: self.auto_rx = min(target_rx, self.auto_rx + self.RX_STEP)
+        elif self.auto_rx > target_rx: self.auto_rx = max(target_rx, self.auto_rx - self.RX_STEP)
+
+        if self.auto_lx < target_lx: self.auto_lx = min(target_lx, self.auto_lx + self.LX_STEP)
+        elif self.auto_lx > target_lx: self.auto_lx = max(target_lx, self.auto_lx - self.LX_STEP)
 
         need_more = (
-            (abs(self.auto_ry - target_ry) > 1e-6) or self._forward_holding or self._back_holding or
-            (abs(self.auto_rx - target_rx) > 1e-6) or self._left_holding   or self._right_holding or
-            (abs(self.auto_lx - target_lx) > 1e-6) or self._yaw_left_holding or self._yaw_right_holding
+            (abs(self.auto_ry - target_ry) > 1e-6) or self._forward_holding or back_eff or
+            (abs(self.auto_rx - target_rx) > 1e-6) or right_eff or left_eff or
+            (abs(self.auto_lx - target_lx) > 1e-6) or yaw_r_eff or yaw_l_eff
         )
         if need_more:
             self._ramp_job = self.after(33, self._ramp_tick)
+
+    # ===== Enhanced follow: helper =====
+    def _reinint_tracker_for_selected(self, frame_bgr, bbox_xyxy):
+        self.sel_hist = compute_hist(frame_bgr, bbox_xyxy)
+        if USE_CV_TRACKER:
+            try:
+                self.cv_tracker = make_cv_tracker()
+                x1,y1,x2,y2 = map(int, bbox_xyxy)
+                self.cv_tracker.init(frame_bgr, (x1, y1, x2-x1, y2-y1))
+            except Exception:
+                self.cv_tracker = None
+
+    def _apply_auto_nav_holds(self):
+        """UI thread: apply/release auto holds based on timers & state."""
+        now = time.monotonic()
+        # Only in Auto + Follow ON
+        if self.gp.state != ForwardState.OFF or not self.target_follow:
+            if any([self._auto_left, self._auto_right, self._auto_yaw_left, self._auto_yaw_right, self._auto_back]):
+                self._clear_auto_holds()
+            return
+
+        desired_auto_left  = (now < self._nav_left_until)
+        desired_auto_right = (now < self._nav_right_until)
+        desired_auto_back  = (now < self._nav_back_until)    # <-- NEW
+
+        # Exclusivity: trái/phải (ưu tiên cái gia hạn gần nhất)
+        if desired_auto_left and desired_auto_right:
+            if self._nav_left_until >= self._nav_right_until:
+                desired_auto_right = False
+            else:
+                desired_auto_left = False
+
+        changed = False
+        # Left group
+        if desired_auto_left:
+            if not self._auto_left or not self._auto_yaw_left:
+                self._auto_left, self._auto_yaw_left = True, True; changed = True
+            if self._auto_right or self._auto_yaw_right:
+                self._auto_right = self._auto_yaw_right = False; changed = True
+        else:
+            if self._auto_left or self._auto_yaw_left:
+                self._auto_left = self._auto_yaw_left = False; changed = True
+
+        # Right group
+        if desired_auto_right:
+            if not self._auto_right or not self._auto_yaw_right:
+                self._auto_right, self._auto_yaw_right = True, True; changed = True
+            if self._auto_left or self._auto_yaw_left:
+                self._auto_left = self._auto_yaw_left = False; changed = True
+        else:
+            if self._auto_right or self._auto_yaw_right:
+                self._auto_right = self._auto_yaw_right = False; changed = True
+
+        # Backward (independent, no auto-forward)
+        if desired_auto_back:
+            if not self._auto_back:
+                self._auto_back = True; changed = True
+        else:
+            if self._auto_back:
+                self._auto_back = False; changed = True
+
+        if changed:
+            self._start_ramp_loop()
 
     def _loop_worker(self):
         gen = self.model.track(source=CAM_INDEX, conf=CONF_THRES,
@@ -808,13 +1009,22 @@ class App(tk.Tk):
             except Exception:
                 continue
 
+            # Collect tracks
             self.last_tracks = {}
+            id_to_box, id_to_area = {}, {}
             if res.boxes is not None and len(res.boxes) > 0:
                 ids = res.boxes.id.detach().cpu().numpy().astype(int) if res.boxes.id is not None else None
                 clss = res.boxes.cls.detach().cpu().numpy().astype(int) if res.boxes.cls is not None else None
+                bxy = res.boxes.xyxy.detach().cpu().numpy()
                 if ids is not None and clss is not None:
                     for i in range(min(len(ids), len(clss))):
-                        self.last_tracks[int(ids[i])] = int(clss[i])
+                        tid = int(ids[i]); cls_i = int(clss[i])
+                        self.last_tracks[tid] = cls_i
+                if ids is not None:
+                    for i, tid in enumerate(ids):
+                        x1,y1,x2,y2 = bxy[i]
+                        id_to_box[int(tid)] = (float(x1), float(y1), float(x2), float(y2))
+                        id_to_area[int(tid)] = max(0,(x2-x1))*max(0,(y2-y1))
 
             self._rebuild_available_ids()
 
@@ -826,6 +1036,9 @@ class App(tk.Tk):
                     self.selected_id = sig_id
                     self.reselect_signature = (sig_id, sig_cls_id, sig_cls_name)
                     self.log(f"Reacquired locked target ID={sig_id} class={sig_cls_name}")
+                    if sig_id in id_to_box:
+                        self.pred.update_with_detection(id_to_box[sig_id])
+                        self._reinint_tracker_for_selected(res.orig_img, id_to_box[sig_id])
 
             # Restore theo reselect_signature
             if (not self.lock_target) and self.reselect_signature is not None and self.selected_id is None and self.show_boxes:
@@ -834,18 +1047,77 @@ class App(tk.Tk):
                 if cond_in_filter and sig_id in self.last_tracks and self.last_tracks[sig_id] == sig_cls_id:
                     self.selected_id = sig_id
                     self.log(f"Restored selection for target ID={sig_id} class={sig_cls_name}")
+                    if sig_id in id_to_box:
+                        self.pred.update_with_detection(id_to_box[sig_id])
+                        self._reinint_tracker_for_selected(res.orig_img, id_to_box[sig_id])
 
-            if self.selected_id is not None and self.selected_id not in self.available_ids:
-                self.log(f"Lost/hidden target ID={self.selected_id}")
-                cls_id, cls_name = self._get_class_for_id(self.selected_id)
-                if cls_id is not None:
-                    self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name))
-                self.selected_id = None
-                # If following while lost -> keep OFF to avoid confusion
-                if self.target_follow:
-                    self.target_follow = False
-                    self.follow_btn_var.set("Target Follow: OFF")
-                    self.log("Target Follow -> OFF (target lost)")
+            # Handle selected target with enhanced persistence
+            current_target_box = None
+            if self.show_boxes and self.selected_id is not None:
+                sel_id = int(self.selected_id)
+                if sel_id in id_to_box:
+                    true_box = id_to_box[sel_id]
+                    self.pred.update_with_detection(true_box)
+                    self.predicted_box = None
+                    self._reinint_tracker_for_selected(res.orig_img, true_box)
+                    current_target_box = tuple(map(int, true_box))
+                else:
+                    pb = self.pred.predict_next()
+                    trk_box = None
+                    if USE_CV_TRACKER and self.cv_tracker is not None:
+                        try:
+                            ok, box = self.cv_tracker.update(res.orig_img)
+                            if ok:
+                                x,y,w,h = box
+                                trk_box = (int(x), int(y), int(x+w), int(y+h))
+                        except Exception:
+                            self.cv_tracker = None
+                    bridge_box = trk_box or pb
+                    self.predicted_box = bridge_box
+                    current_target_box = bridge_box
+
+                    if bridge_box is not None and len(id_to_box) > 0:
+                        best_id, best_iou, best_sim = None, 0.0, 0.0
+                        for tid, dbox in id_to_box.items():
+                            if id_to_area.get(tid, 0) < MIN_AREA_REACQ:
+                                continue
+                            if self.display_allowed is not None:
+                                cls_t = self.last_tracks.get(int(tid), None)
+                                if cls_t not in self.display_allowed:
+                                    continue
+                            i = iou(bridge_box, dbox)
+                            if i >= self.PRED_IOU_THR:
+                                if self.sel_hist is None:
+                                    if i > best_iou:
+                                        best_iou, best_id, best_sim = i, int(tid), 0.0
+                                else:
+                                    sim = cosine_sim(self.sel_hist, compute_hist(res.orig_img, dbox))
+                                    if (sim > best_sim + 1e-5) or (abs(sim-best_sim)<=1e-5 and i>best_iou):
+                                        best_sim, best_iou, best_id = sim, i, int(tid)
+                        if best_id is not None and (best_sim >= self.hist_sim_thr or self.sel_hist is None):
+                            if best_id != sel_id:
+                                self.log(f"Re-acquired: ID {sel_id} → {best_id} (IoU {best_iou:.2f}, hist {best_sim:.2f})")
+                                self.selected_id = best_id
+                            self.pred.update_with_detection(id_to_box[int(self.selected_id)])
+                            self._reinint_tracker_for_selected(res.orig_img, id_to_box[int(self.selected_id)])
+                            self.predicted_box = None
+                            current_target_box = tuple(map(int, id_to_box[int(self.selected_id)]))
+                    if bridge_box is None:
+                        self.log(f"Target lost after prediction gap (ID={sel_id})")
+                        cls_id, cls_name = self._get_class_for_id(sel_id)
+                        if cls_id is not None:
+                            self.reselect_signature = (int(sel_id), int(cls_id), str(cls_name))
+                        self.selected_id = None
+                        self.pred.reset()
+                        self.cv_tracker = None
+                        self.sel_hist = None
+                        self.last_nav_cmd = None
+                        self._clear_auto_holds()
+                        if self.target_follow:
+                            self.target_follow = False
+                            self.follow_btn_var.set("Target Follow: OFF")
+                            self.log("Target Follow -> OFF (gap limit)")
+                        current_target_box = None
 
             # Manual control I/O
             r_lx, r_ly, r_rx, r_ry = self.gp.read_axes_real()
@@ -858,10 +1130,59 @@ class App(tk.Tk):
             elif self.gp.state == ForwardState.ON:
                 self.gp.send_to_virtual(r_lx,r_ly,r_rx,r_ry)
 
-            # cập nhật frame
+            # cập nhật frame & vẽ
             frame = res.orig_img.copy()
+            frame_h, frame_w = frame.shape[:2]
             frame = draw_tracks(frame, res, self.selected_id, self.names,
                                 show=self.show_boxes, allowed_classes=self.display_allowed)
+
+            # vẽ ghost box nếu đang bridge
+            if self.show_boxes and self.selected_id is not None and self.pred.active:
+                label = "TRACK" if (self.cv_tracker is not None and self.predicted_box is not None) else "PRED"
+                frame = draw_predicted_box(frame, self.predicted_box, label=label)
+
+            # Crosshair trung tâm (luôn bật)
+            draw_crosshair_center(frame, size=CROSSHAIR_CENTER_SIZE, color=(255, 0, 0))
+
+            # CHỈ vẽ crosshair mục tiêu & sinh NAV CMD khi Follow ON **và** Flight Mode = Auto
+            cmd_text = None
+            if self.target_follow and self.gp.state == ForwardState.OFF and current_target_box is not None:
+                x1,y1,x2,y2 = current_target_box
+                cx_obj, cy_obj = int((x1+x2)//2), int((y1+y2)//2)
+                draw_crosshair_at(frame, cx_obj, cy_obj, size=CROSSHAIR_TARGET_SIZE, color=(0, 255, 255))
+                dx, dy = cx_obj - (frame_w//2), cy_obj - (frame_h//2)
+                direction = []
+                horiz = None
+                if abs(dx) > self.nav_dead_zone_px:
+                    horiz = "Right" if dx > 0 else "Left"
+                    direction.append(horiz)
+                down_flag = False
+                if abs(dy) > self.nav_dead_zone_px:
+                    vert = "Down" if dy > 0 else "Up"
+                    direction.append(vert)
+                    down_flag = (vert == "Down")
+                cmd_text = " ".join(direction) if direction else "Hold"
+                if cmd_text != self.last_nav_cmd:
+                    self.log(f"NAV CMD -> {cmd_text}")
+                    self.last_nav_cmd = cmd_text
+
+                # ====== Auto-hold timers ======
+                now = time.monotonic()
+                if horiz == "Right":
+                    self._nav_right_until = now + 1.0
+                    self._nav_left_until = 0.0
+                elif horiz == "Left":
+                    self._nav_left_until = now + 1.0
+                    self._nav_right_until = 0.0
+                # Backward on Down
+                if down_flag:
+                    self._nav_back_until = now + 1.0
+                # nếu không Down thì để timer tự hết
+            else:
+                if self.last_nav_cmd is not None and (not self.target_follow or self.gp.state != ForwardState.OFF):
+                    self.last_nav_cmd = None
+                # timers sẽ được clear trong UI thread khi _apply_auto_nav_holds()
+
             fixed = resize_with_letterbox(frame, VIDEO_W, VIDEO_H)
             with self.frame_lock:
                 self.latest_bgr = fixed
@@ -877,6 +1198,9 @@ class App(tk.Tk):
         self.state_var.set(f"Flight Mode: {self.gp.state}")
         self._update_flight_mode_controls()
         self.pad_name_var.set(self.gp.pad_name)
+
+        # Apply auto-holds (based on timers & state)
+        self._apply_auto_nav_holds()
 
         vals = [self.gp.r_lx, self.gp.r_ly, self.gp.r_rx, self.gp.r_ry]
         for var, v in zip(self.real_vars, vals):

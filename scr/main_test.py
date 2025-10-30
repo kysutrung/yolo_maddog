@@ -57,12 +57,12 @@ REACQ_IOU_THR       = 0.32   # ngưỡng IoU cho re-acquire quanh vị trí dự
 HIST_SIM_THR        = 0.50   # 0..1 (cosine) -> xác nhận appearance
 USE_CV_TRACKER      = True   # bật bộ theo dõi OpenCV làm cầu nối
 CV_TRACKER_TYPE     = "CSRT" # CSRT/KCF/MOSSE
-MIN_AREA_REACQ      = 400    # bỏ qua box quá nhỏ khi re-acquire
+MIN_AREA_REACQ      = 200    # bỏ qua box quá nhỏ khi re-acquire
 # =====================================================
 
 # ======== Navigation without on-frame text ========
 NAV_DEAD_ZONE_PX      = 20     # vùng chết tính trên frame gốc
-CROSSHAIR_CENTER_SIZE = 8
+CROSSHAIR_CENTER_SIZE = 6
 CROSSHAIR_TARGET_SIZE = 6
 # =====================================================
 
@@ -320,9 +320,9 @@ class App(tk.Tk):
         self._init_styles()
 
         # ---- Auto ramp settings (LX, RX, RY) ----
-        self.RY_CAP = 0.400; self.RY_STEP = 0.05
-        self.RX_CAP = 0.400; self.RX_STEP = 0.05
-        self.LX_CAP = 0.400; self.LX_STEP = 0.05
+        self.RY_CAP = 0.200; self.RY_STEP = 0.05
+        self.RX_CAP = 0.200; self.RX_STEP = 0.05
+        self.LX_CAP = 0.200; self.LX_STEP = 0.05
 
         # Giá trị hiện tại (Auto) gửi ra vgamepad
         self.auto_ry = 0.0

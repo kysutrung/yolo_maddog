@@ -1,7 +1,3 @@
-# yolo_gamepad_forward_tk_spacer_enhanced_crosshair_auto_follow_navhold_downback.py
-# GUI with enhanced persistent tracking + center/target crosshair
-# Target Follow ONLY in Auto; Auto-hold Yaw+Lateral (Left/Right) and Backward (when Down) based on NAV CMD for up to 1s
-# pip install ultralytics opencv-python numpy pillow pygame vgamepad
 
 import os
 import cv2
@@ -61,7 +57,7 @@ MIN_AREA_REACQ      = 200    # bỏ qua box quá nhỏ khi re-acquire
 # =====================================================
 
 # ======== Navigation without on-frame text ========
-NAV_DEAD_ZONE_PX      = 20     # vùng chết tính trên frame gốc
+NAV_DEAD_ZONE_PX      = 100     # vùng chết tính trên frame gốc
 CROSSHAIR_CENTER_SIZE = 6
 CROSSHAIR_TARGET_SIZE = 6
 # =====================================================
@@ -276,7 +272,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(WIN_TITLE)
-        self.geometry("1420x820")
+        self.geometry("1420x900")
         if START_FULLSCREEN:
             self.attributes("-fullscreen", True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -320,9 +316,9 @@ class App(tk.Tk):
         self._init_styles()
 
         # ---- Auto ramp settings (LX, RX, RY) ----
-        self.RY_CAP = 0.200; self.RY_STEP = 0.05
-        self.RX_CAP = 0.200; self.RX_STEP = 0.05
-        self.LX_CAP = 0.200; self.LX_STEP = 0.05
+        self.RY_CAP = 0.150; self.RY_STEP = 0.05
+        self.RX_CAP = 0.150; self.RX_STEP = 0.05
+        self.LX_CAP = 0.150; self.LX_STEP = 0.05
 
         # Giá trị hiện tại (Auto) gửi ra vgamepad
         self.auto_ry = 0.0
@@ -338,15 +334,17 @@ class App(tk.Tk):
         self._yaw_left_holding  = False
         self._yaw_right_holding = False
 
-        # NEW: Auto-hold (from NAV CMD)
-        self._auto_left = False
-        self._auto_right = False
+        # Auto-hold flags/timers
+        self._auto_left = False          # sẽ KHÔNG còn ảnh hưởng RX
+        self._auto_right = False         # sẽ KHÔNG còn ảnh hưởng RX
         self._auto_yaw_left = False
         self._auto_yaw_right = False
-        self._auto_back = False                # <-- NEW
+        self._auto_back = False
+        self._auto_forward = False
         self._nav_left_until = 0.0
         self._nav_right_until = 0.0
-        self._nav_back_until = 0.0             # <-- NEW
+        self._nav_back_until = 0.0
+        self._nav_forward_until = 0.0
 
         # giữ LY khi vào Auto
         self.auto_ly_hold = 0.0
@@ -364,6 +362,14 @@ class App(tk.Tk):
         # ===== Navigation (logs only) =====
         self.nav_dead_zone_px = NAV_DEAD_ZONE_PX
         self.last_nav_cmd = None  # tránh spam log
+
+        # ===== Distance Estimation (NEW) =====
+        self.ref_rect = None
+        self.ref_area = None
+        self.last_distance_state = None
+        self.dist_thr_near_low = 0.70
+        self.dist_thr_near_high = 1.30
+        self.draw_ref_rect = True
 
         self._build_ui()
 
@@ -455,6 +461,7 @@ class App(tk.Tk):
         left = ttk.Frame(root, width=VIDEO_W, height=VIDEO_H)
         left.pack(side="left")
         left.pack_propagate(False)
+
         self.video_canvas = tk.Canvas(left, width=VIDEO_W, height=VIDEO_H, bg="black", highlightthickness=0)
         self.video_canvas.pack()
 
@@ -645,12 +652,17 @@ class App(tk.Tk):
 
     def _clear_auto_holds(self):
         changed = any([self._auto_left, self._auto_right, self._auto_yaw_left,
-                       self._auto_yaw_right, self._auto_back])
-        self._auto_left = self._auto_right = False
-        self._auto_yaw_left = self._auto_yaw_right = False
-        self._auto_back = False
+                       self._auto_yaw_right, self._auto_back, self._auto_forward])
+        # Giữ yaw/forward/back nếu có; KHÔNG dùng _auto_left/_auto_right cho RX nữa
+        self._auto_left = self._auto_right = False  # vô hiệu hóa tự động RX triệt để
         self._nav_left_until = self._nav_right_until = 0.0
+        # các hướng khác giữ nguyên timers (dưới)
+        if self._auto_yaw_left or self._auto_yaw_right or self._auto_back or self._auto_forward:
+            changed = True
         self._nav_back_until = 0.0
+        self._nav_forward_until = 0.0
+        self._auto_back = False
+        self._auto_forward = False
         if changed:
             self._start_ramp_loop()
 
@@ -676,6 +688,7 @@ class App(tk.Tk):
             self.cv_tracker = None; self.sel_hist = None
             self.last_nav_cmd = None
             self._clear_auto_holds()
+            self.last_distance_state = None
             self.log("No target is currently selected")
         self._update_target_controls_state()
 
@@ -769,6 +782,7 @@ class App(tk.Tk):
                 self.cv_tracker = None; self.sel_hist = None
                 self.last_nav_cmd = None
                 self._clear_auto_holds()
+                self.last_distance_state = None
         else:
             self.log("No available targets to select")
         self._update_target_controls_state()
@@ -795,6 +809,7 @@ class App(tk.Tk):
             self.log(f"Selected target ID={self.selected_id}")
             self.last_nav_cmd = None
             self._clear_auto_holds()
+            self.last_distance_state = None
         else:
             self.log("No available targets")
         self._update_target_controls_state()
@@ -821,6 +836,7 @@ class App(tk.Tk):
             self.log(f"Selected target ID={self.selected_id}")
             self.last_nav_cmd = None
             self._clear_auto_holds()
+            self.last_distance_state = None
         else:
             self.log("No available targets")
         self._update_target_controls_state()
@@ -897,12 +913,18 @@ class App(tk.Tk):
         if self.gp.state != ForwardState.OFF:
             return
 
-        # ===== Combine manual + auto-hold flags =====
-        right_eff = self._right_holding or self._auto_right
-        left_eff  = self._left_holding  or self._auto_left
+        # ===== Combine manual + auto flags =====
+        # >>> RX: BỎ HẲN AUTO — chỉ manual mới ảnh hưởng RX
+        right_eff = self._right_holding                 # no self._auto_right
+        left_eff  = self._left_holding                  # no self._auto_left
+
+        # Yaw (LX) vẫn có auto-hold
         yaw_r_eff = self._yaw_right_holding or self._auto_yaw_right
         yaw_l_eff = self._yaw_left_holding  or self._auto_yaw_left
-        back_eff  = self._back_holding or self._auto_back   # <-- NEW
+
+        # Forward/Backward (RY) vẫn có auto-hold (khoảng cách)
+        back_eff  = self._back_holding or self._auto_back
+        fwd_eff   = self._forward_holding or self._auto_forward
 
         # Targets
         if right_eff and not left_eff:     target_rx = +self.RX_CAP
@@ -913,9 +935,9 @@ class App(tk.Tk):
         elif yaw_l_eff and not yaw_r_eff:  target_lx = -self.LX_CAP
         else:                              target_lx = 0.0
 
-        if self._forward_holding and not back_eff:   target_ry = +self.RY_CAP
-        elif back_eff and not self._forward_holding: target_ry = -self.RY_CAP
-        else:                                        target_ry = 0.0
+        if fwd_eff and not back_eff:       target_ry = +self.RY_CAP
+        elif back_eff and not fwd_eff:     target_ry = -self.RY_CAP
+        else:                              target_ry = 0.0
 
         # Ramp
         if self.auto_ry < target_ry: self.auto_ry = min(target_ry, self.auto_ry + self.RY_STEP)
@@ -928,7 +950,7 @@ class App(tk.Tk):
         elif self.auto_lx > target_lx: self.auto_lx = max(target_lx, self.auto_lx - self.LX_STEP)
 
         need_more = (
-            (abs(self.auto_ry - target_ry) > 1e-6) or self._forward_holding or back_eff or
+            (abs(self.auto_ry - target_ry) > 1e-6) or fwd_eff or back_eff or
             (abs(self.auto_rx - target_rx) > 1e-6) or right_eff or left_eff or
             (abs(self.auto_lx - target_lx) > 1e-6) or yaw_r_eff or yaw_l_eff
         )
@@ -951,52 +973,112 @@ class App(tk.Tk):
         now = time.monotonic()
         # Only in Auto + Follow ON
         if self.gp.state != ForwardState.OFF or not self.target_follow:
-            if any([self._auto_left, self._auto_right, self._auto_yaw_left, self._auto_yaw_right, self._auto_back]):
-                self._clear_auto_holds()
+            if any([self._auto_left, self._auto_right, self._auto_yaw_left, self._auto_yaw_right, self._auto_back, self._auto_forward]):
+                # dọn sạch auto flags; RX auto đã vô hiệu hoá ở ramp_tick
+                self._auto_left = self._auto_right = False
+                self._auto_yaw_left = self._auto_yaw_right = False
+                self._auto_back = self._auto_forward = False
             return
 
-        desired_auto_left  = (now < self._nav_left_until)
-        desired_auto_right = (now < self._nav_right_until)
-        desired_auto_back  = (now < self._nav_back_until)    # <-- NEW
+        desired_auto_left    = (now < self._nav_left_until)
+        desired_auto_right   = (now < self._nav_right_until)
+        desired_auto_back    = (now < self._nav_back_until)
+        desired_auto_forward = (now < self._nav_forward_until)
 
-        # Exclusivity: trái/phải (ưu tiên cái gia hạn gần nhất)
+        # Exclusivity trái/phải cho Yaw (không ảnh hưởng RX)
         if desired_auto_left and desired_auto_right:
             if self._nav_left_until >= self._nav_right_until:
                 desired_auto_right = False
             else:
                 desired_auto_left = False
 
+        # Exclusivity tiến/lùi
+        if desired_auto_forward and desired_auto_back:
+            if self._nav_forward_until >= self._nav_back_until:
+                desired_auto_back = False
+            else:
+                desired_auto_forward = False
+
         changed = False
-        # Left group
+        # === Chỉ kích hoạt YAW tự động; KHÔNG kích hoạt RX tự động ===
+        # Left group -> chỉ yaw_left
         if desired_auto_left:
-            if not self._auto_left or not self._auto_yaw_left:
-                self._auto_left, self._auto_yaw_left = True, True; changed = True
-            if self._auto_right or self._auto_yaw_right:
-                self._auto_right = self._auto_yaw_right = False; changed = True
+            if not self._auto_yaw_left:
+                self._auto_yaw_left = True; changed = True
+            if self._auto_yaw_right:
+                self._auto_yaw_right = False; changed = True
         else:
-            if self._auto_left or self._auto_yaw_left:
-                self._auto_left = self._auto_yaw_left = False; changed = True
+            if self._auto_yaw_left:
+                self._auto_yaw_left = False; changed = True
 
-        # Right group
+        # Right group -> chỉ yaw_right
         if desired_auto_right:
-            if not self._auto_right or not self._auto_yaw_right:
-                self._auto_right, self._auto_yaw_right = True, True; changed = True
-            if self._auto_left or self._auto_yaw_left:
-                self._auto_left = self._auto_yaw_left = False; changed = True
+            if not self._auto_yaw_right:
+                self._auto_yaw_right = True; changed = True
+            if self._auto_yaw_left:
+                self._auto_yaw_left = False; changed = True
         else:
-            if self._auto_right or self._auto_yaw_right:
-                self._auto_right = self._auto_yaw_right = False; changed = True
+            if self._auto_yaw_right:
+                self._auto_yaw_right = False; changed = True
 
-        # Backward (independent, no auto-forward)
+        # >>> Không bao giờ bật _auto_left/_auto_right (RX auto) <<<
+        if self._auto_left or self._auto_right:
+            self._auto_left = self._auto_right = False; changed = True
+
+        # Forward/backward (khoảng cách)
+        if desired_auto_forward:
+            if not self._auto_forward:
+                self._auto_forward = True; changed = True
+            if self._auto_back:
+                self._auto_back = False; changed = True
+        else:
+            if self._auto_forward:
+                self._auto_forward = False; changed = True
+
         if desired_auto_back:
             if not self._auto_back:
                 self._auto_back = True; changed = True
+            if self._auto_forward:
+                self._auto_forward = False; changed = True
         else:
             if self._auto_back:
                 self._auto_back = False; changed = True
 
         if changed:
             self._start_ramp_loop()
+
+    # ===== Distance Estimation helpers (NEW) =====
+    def _init_reference_rect(self, frame_w, frame_h):
+        """Tạo hình chữ nhật trung tâm làm tham chiếu cho khoảng cách."""
+        w, h = int(frame_w * 0.5), int(frame_h * 0.75)  # "vừa phải"
+        cx, cy = frame_w // 2, frame_h // 2
+        x1, y1 = cx - w // 2, cy - h // 2
+        x2, y2 = cx + w // 2, cy + h // 2
+        self.ref_rect = (x1, y1, x2, y2)
+        self.ref_area = w * h
+        self.log(f"Reference rectangle initialized: area={self.ref_area}")
+
+    def _estimate_distance_state(self, current_box):
+        """So sánh diện tích box hiện tại với hình tham chiếu; trả về (state, ratio)."""
+        if self.ref_rect is None or current_box is None:
+            return None, None
+        x1, y1, x2, y2 = current_box
+        area = max(0, (x2 - x1)) * max(0, (y2 - y1))
+        ratio = area / (self.ref_area + 1e-6)
+        if ratio < self.dist_thr_near_low:
+            state = "Far"
+        elif ratio <= self.dist_thr_near_high:
+            state = "Near"
+        else:
+            state = "Too Close"
+        return state, ratio
+
+    def _draw_reference_rect(self, frame, color=(200, 200, 200)):
+        if not self.draw_ref_rect or self.ref_rect is None:
+            return frame
+        x1, y1, x2, y2 = self.ref_rect
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+        return frame
 
     def _loop_worker(self):
         gen = self.model.track(source=CAM_INDEX, conf=CONF_THRES,
@@ -1113,6 +1195,7 @@ class App(tk.Tk):
                         self.sel_hist = None
                         self.last_nav_cmd = None
                         self._clear_auto_holds()
+                        self.last_distance_state = None
                         if self.target_follow:
                             self.target_follow = False
                             self.follow_btn_var.set("Target Follow: OFF")
@@ -1133,6 +1216,11 @@ class App(tk.Tk):
             # cập nhật frame & vẽ
             frame = res.orig_img.copy()
             frame_h, frame_w = frame.shape[:2]
+
+            # Khởi tạo khung tham chiếu 1 lần
+            if self.ref_rect is None:
+                self._init_reference_rect(frame_w, frame_h)
+
             frame = draw_tracks(frame, res, self.selected_id, self.names,
                                 show=self.show_boxes, allowed_classes=self.display_allowed)
 
@@ -1141,32 +1229,31 @@ class App(tk.Tk):
                 label = "TRACK" if (self.cv_tracker is not None and self.predicted_box is not None) else "PRED"
                 frame = draw_predicted_box(frame, self.predicted_box, label=label)
 
+            # Vẽ khung tham chiếu (tùy chọn)
+            frame = self._draw_reference_rect(frame, color=(220, 220, 220))
+
             # Crosshair trung tâm (luôn bật)
             draw_crosshair_center(frame, size=CROSSHAIR_CENTER_SIZE, color=(255, 0, 0))
 
-            # CHỈ vẽ crosshair mục tiêu & sinh NAV CMD khi Follow ON **và** Flight Mode = Auto
-            cmd_text = None
+            # ===== Follow logic: chỉ Yaw auto; RX không auto; RY dựa khoảng cách =====
             if self.target_follow and self.gp.state == ForwardState.OFF and current_target_box is not None:
                 x1,y1,x2,y2 = current_target_box
                 cx_obj, cy_obj = int((x1+x2)//2), int((y1+y2)//2)
                 draw_crosshair_at(frame, cx_obj, cy_obj, size=CROSSHAIR_TARGET_SIZE, color=(0, 255, 255))
-                dx, dy = cx_obj - (frame_w//2), cy_obj - (frame_h//2)
-                direction = []
+                dx = cx_obj - (frame_w//2)
+
+                # Chỉ sinh lệnh L/R để phục vụ Yaw (không tác động RX auto)
                 horiz = None
                 if abs(dx) > self.nav_dead_zone_px:
                     horiz = "Right" if dx > 0 else "Left"
-                    direction.append(horiz)
-                down_flag = False
-                if abs(dy) > self.nav_dead_zone_px:
-                    vert = "Down" if dy > 0 else "Up"
-                    direction.append(vert)
-                    down_flag = (vert == "Down")
-                cmd_text = " ".join(direction) if direction else "Hold"
+
+                # Log ngắn gọn (chỉ LR)
+                cmd_text = horiz if horiz else "Hold"
                 if cmd_text != self.last_nav_cmd:
                     self.log(f"NAV CMD -> {cmd_text}")
                     self.last_nav_cmd = cmd_text
 
-                # ====== Auto-hold timers ======
+                # ====== Timers cho yaw (tận dụng left/right timers cũ) ======
                 now = time.monotonic()
                 if horiz == "Right":
                     self._nav_right_until = now + 1.0
@@ -1174,14 +1261,23 @@ class App(tk.Tk):
                 elif horiz == "Left":
                     self._nav_left_until = now + 1.0
                     self._nav_right_until = 0.0
-                # Backward on Down
-                if down_flag:
-                    self._nav_back_until = now + 1.0
-                # nếu không Down thì để timer tự hết
+
+                # ====== Distance-based Forward/Backward ======
+                dist_state, ratio = self._estimate_distance_state(current_target_box)
+                if dist_state is not None:
+                    if dist_state != self.last_distance_state:
+                        self.last_distance_state = dist_state
+                        self.log(f"Distance state -> {dist_state} (ratio={ratio:.2f})")
+                    if dist_state == "Far":
+                        self._nav_forward_until = now + 1.0
+                        self._nav_back_until = 0.0
+                    elif dist_state == "Too Close":
+                        self._nav_back_until = now + 1.0
+                        self._nav_forward_until = 0.0
+                    # Near -> không gia hạn, để timer tự hết
             else:
                 if self.last_nav_cmd is not None and (not self.target_follow or self.gp.state != ForwardState.OFF):
                     self.last_nav_cmd = None
-                # timers sẽ được clear trong UI thread khi _apply_auto_nav_holds()
 
             fixed = resize_with_letterbox(frame, VIDEO_W, VIDEO_H)
             with self.frame_lock:

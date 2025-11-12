@@ -25,7 +25,7 @@ except ImportError:
     vg = None
 
 # =================== Configuration ===================
-WEIGHTS        = "yolo_weights/yolov8n.pt"
+WEIGHTS        = "yolo_weights/yolov8m.pt"
 USE_GPU        = True
 CONF_THRES     = 0.30
 # Chỉ quét 3 lớp: person(0), car(2), motorcycle(3)
@@ -316,7 +316,7 @@ class App(tk.Tk):
         self._init_styles()
 
         # ---- Auto ramp settings (LX, RX, RY) ----
-        self.RY_CAP = 0.150; self.RY_STEP = 0.05
+        self.RY_CAP = 0.200; self.RY_STEP = 0.05
         self.RX_CAP = 0.150; self.RX_STEP = 0.05
         self.LX_CAP = 0.150; self.LX_STEP = 0.05
 

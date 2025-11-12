@@ -55,7 +55,7 @@ MIN_AREA_REACQ      = 200
 # =====================================================
 
 # ======== Navigation without on-frame text ========
-NAV_DEAD_ZONE_PX      = 50
+NAV_DEAD_ZONE_PX      = 70
 CROSSHAIR_CENTER_SIZE = 6
 CROSSHAIR_TARGET_SIZE = 6
 # =====================================================
@@ -313,8 +313,8 @@ class App(tk.Tk):
 
         # ---- Auto ramp settings ----
         self.RY_CAP = 0.200; self.RY_STEP = 0.05
-        self.RX_CAP = 0.200; self.RX_STEP = 0.05
-        self.LX_CAP = 0.200; self.LX_STEP = 0.05
+        self.RX_CAP = 0.15; self.RX_STEP = 0.05
+        self.LX_CAP = 0.15; self.LX_STEP = 0.05
 
         # Giá trị hiện tại (Auto) gửi ra vgamepad
         self.auto_ry = 0.0
@@ -585,30 +585,45 @@ class App(tk.Tk):
         self.btn_yaw_right.bind("<ButtonPress-1>", self._yaw_right_press)
         self.btn_yaw_right.bind("<ButtonRelease-1>", self._yaw_right_release)
 
-        # ---- 3) Control Parameters
+        # ---- 3) Control Parameters (ĐÃ CHUYỂN THÀNH BẢNG NGANG)
         params = ttk.Frame(right)
         ttk.Label(params, text="Control Parameters", style="Section.TLabel").pack(anchor="w", pady=(0,4))
         telem = ttk.Frame(params); telem.pack(anchor="w", fill="x")
+
         mono_font = ("Consolas", 10) if os.name=="nt" else ("Menlo", 10)
-        ttk.Label(telem, text="Gamepad:", style="Compact.TLabel", width=10).grid(row=0, column=0, sticky="w", padx=(0,6), pady=2)
+
+        # Hàng Gamepad
+        ttk.Label(telem, text="Gamepad:", style="Compact.TLabel", width=10)\
+            .grid(row=0, column=0, sticky="w", padx=(0,6), pady=2)
         self.pad_name_var = tk.StringVar(value=self.gp.pad_name)
-        ttk.Label(telem, textvariable=self.pad_name_var, style="Compact.TLabel").grid(row=0, column=1, sticky="w", pady=2)
-        ttk.Label(telem, text="Physical", style="Compact.TLabel", width=10).grid(row=1, column=0, sticky="w", padx=(0,6), pady=(6,2))
-        ttk.Separator(telem, orient="horizontal").grid(row=1, column=1, sticky="ew", pady=(6,2))
-        for i, name in enumerate(["LX","LY","RX","RY"], start=2):
-            ttk.Label(telem, text=f"{name}:", style="Compact.TLabel", width=6).grid(row=i, column=0, sticky="w")
+        ttk.Label(telem, textvariable=self.pad_name_var, style="Compact.TLabel")\
+            .grid(row=0, column=1, columnspan=2, sticky="w", pady=2)
+
+        # Header của bảng
+        ttk.Label(telem, text="Axis", style="Compact.TLabel", width=6)\
+            .grid(row=1, column=0, sticky="w", padx=(0,6), pady=(6,2))
+        ttk.Label(telem, text="Physical", style="Compact.TLabel", width=10)\
+            .grid(row=1, column=1, sticky="w", padx=(0,6), pady=(6,2))
+        ttk.Label(telem, text="Virtual", style="Compact.TLabel", width=10)\
+            .grid(row=1, column=2, sticky="w", padx=(0,0),  pady=(6,2))
+
+        # Các hàng dữ liệu
+        axes = ["LX","LY","RX","RY"]
         self.real_vars = [tk.StringVar(value="+0.000") for _ in range(4)]
-        for i, v in enumerate(self.real_vars, start=2):
-            tk.Label(telem, textvariable=v, font=mono_font, width=7, anchor="e").grid(row=i, column=1, sticky="w")
-        ttk.Label(telem, text="Virtual", style="Compact.TLabel", width=10).grid(row=6, column=0, sticky="w", padx=(0,6), pady=(6,2))
-        ttk.Separator(telem, orient="horizontal").grid(row=6, column=1, sticky="ew", pady=(6,2))
-        for i, name in enumerate(["LX","LY","RX","RY"], start=7):
-            ttk.Label(telem, text=f"{name}:", style="Compact.TLabel", width=6).grid(row=i, column=0, sticky="w")
         self.virt_vars = [tk.StringVar(value="+0.000") for _ in range(4)]
-        for i, v in enumerate(self.virt_vars, start=7):
-            tk.Label(telem, textvariable=v, font=mono_font, width=7, anchor="e").grid(row=i, column=1, sticky="w")
+
+        for i, name in enumerate(axes):
+            r = 2 + i
+            ttk.Label(telem, text=f"{name}:", style="Compact.TLabel", width=6)\
+                .grid(row=r, column=0, sticky="w", padx=(0,6))
+            tk.Label(telem, textvariable=self.real_vars[i], font=mono_font, width=7, anchor="e")\
+                .grid(row=r, column=1, sticky="w")
+            tk.Label(telem, textvariable=self.virt_vars[i], font=mono_font, width=7, anchor="e")\
+                .grid(row=r, column=2, sticky="w")
+
         telem.grid_columnconfigure(0, weight=0)
         telem.grid_columnconfigure(1, weight=1)
+        telem.grid_columnconfigure(2, weight=1)
 
         # ---- 4) Logs
         logs = ttk.Frame(right)

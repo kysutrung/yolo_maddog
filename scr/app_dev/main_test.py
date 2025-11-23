@@ -1,11 +1,10 @@
-
 import os
 import cv2
 import numpy as np
 import threading
 from datetime import datetime
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 import queue
@@ -25,10 +24,9 @@ except ImportError:
     vg = None
 
 # =================== Configuration ===================
-WEIGHTS        = "yolo_weights/yolov8m.pt"
+WEIGHTS        = "yolo_weights/yolov8m.engine"
 USE_GPU        = True
 CONF_THRES     = 0.30
-# Chỉ quét 3 lớp: person(0), car(2), motorcycle(3)
 CLASSES        = [0, 2, 3]
 TRACKER_CFG    = "bytetrack.yaml"
 PERSIST_ID     = True
@@ -40,24 +38,24 @@ AX_LX, AX_LY, AX_RY, AX_RX = 0, 1, 2, 3
 DEADZONE, ARM_EPS = 0.08, 0.05
 SWAP_REAL_LR  = True
 
-WIN_TITLE        = "YOLO Mad Dog Control Panel"
+WIN_TITLE        = "YOLO Mad Dog Control Panel By TrungTauLua"
 START_FULLSCREEN = False
-VIDEO_W, VIDEO_H = 960, 720
+VIDEO_W, VIDEO_H = 1024, 768
 RIGHT_PANEL_W    = 320
 THEME_PAD        = 10
 # =====================================================
 
 # ======== Enhanced Follow config ========
-PRED_MAX_GAP        = 12     # số frame dự đoán tối đa trước khi bỏ
-REACQ_IOU_THR       = 0.32   # ngưỡng IoU cho re-acquire quanh vị trí dự đoán/track
-HIST_SIM_THR        = 0.50   # 0..1 (cosine) -> xác nhận appearance
-USE_CV_TRACKER      = True   # bật bộ theo dõi OpenCV làm cầu nối
-CV_TRACKER_TYPE     = "CSRT" # CSRT/KCF/MOSSE
-MIN_AREA_REACQ      = 200    # bỏ qua box quá nhỏ khi re-acquire
+PRED_MAX_GAP        = 30
+REACQ_IOU_THR       = 0.32
+HIST_SIM_THR        = 0.50
+USE_CV_TRACKER      = True
+CV_TRACKER_TYPE     = "CSRT"
+MIN_AREA_REACQ      = 200
 # =====================================================
 
 # ======== Navigation without on-frame text ========
-NAV_DEAD_ZONE_PX      = 100     # vùng chết tính trên frame gốc
+NAV_DEAD_ZONE_PX      = 110
 CROSSHAIR_CENTER_SIZE = 6
 CROSSHAIR_TARGET_SIZE = 6
 # =====================================================
@@ -65,7 +63,6 @@ CROSSHAIR_TARGET_SIZE = 6
 def dz(v, d=DEADZONE): return 0.0 if abs(v) < d else v
 
 class ForwardState:
-    # Giữ tên cũ: OFF = "Auto"
     OFF, ARMING, ON = "Auto", "Arming", "Manual"
 
 # ================== Drawing helpers ==================
@@ -114,13 +111,6 @@ def draw_crosshair_at(frame, x, y, size=CROSSHAIR_TARGET_SIZE, color=(0, 255, 25
 
 # ================== Math & utility ==================
 def next_higher(lst, cur): return next((x for x in lst if x > cur), None)
-def next_lower(lst, cur):
-    prev = None
-    for x in lst:
-        if x >= cur:
-            return prev
-        prev = x
-    return prev
 
 def resize_with_letterbox(bgr, target_w, target_h):
     h, w = bgr.shape[:2]
@@ -285,7 +275,7 @@ class App(tk.Tk):
         self.video_ready = False
         self.gp = GamepadBridge()
         self.model = YOLO(WEIGHTS)
-        self.names = self.model.model.names if hasattr(self.model, "model") else self.model.names
+        self.names = self.model.names
 
         # hiển thị & chọn mục tiêu
         self.show_boxes = False
@@ -297,9 +287,15 @@ class App(tk.Tk):
         self.target_follow = False
         self.follow_btn_var = tk.StringVar(value="Target Follow: OFF")
 
+        # FPS (đưa xuống cuối cột phải)
+        self._fps_frame_count = 0
+        self._fps_last_time = time.monotonic()
+        self._fps_value = 0.0
+        self.fps_var = tk.StringVar(value="FPS: 0.0")
+
         # lọc theo lớp
         self.filter_var = tk.StringVar(value="All")
-        self.display_allowed = None  # None => All
+        self.display_allowed = None
 
         # flight buttons
         self._flight_btns = []
@@ -312,13 +308,13 @@ class App(tk.Tk):
         # log queue
         self.log_queue = queue.Queue()
 
-        # styles
+        # styles    
         self._init_styles()
 
-        # ---- Auto ramp settings (LX, RX, RY) ----
-        self.RY_CAP = 0.200; self.RY_STEP = 0.05
-        self.RX_CAP = 0.150; self.RX_STEP = 0.05
-        self.LX_CAP = 0.150; self.LX_STEP = 0.05
+        # ---- Auto ramp settings ----
+        self.RY_CAP = 0.300; self.RY_STEP = 0.05
+        self.RX_CAP = 0.15; self.RX_STEP = 0.05
+        self.LX_CAP = 0.15; self.LX_STEP = 0.05
 
         # Giá trị hiện tại (Auto) gửi ra vgamepad
         self.auto_ry = 0.0
@@ -335,8 +331,8 @@ class App(tk.Tk):
         self._yaw_right_holding = False
 
         # Auto-hold flags/timers
-        self._auto_left = False          # sẽ KHÔNG còn ảnh hưởng RX
-        self._auto_right = False         # sẽ KHÔNG còn ảnh hưởng RX
+        self._auto_left = False
+        self._auto_right = False
         self._auto_yaw_left = False
         self._auto_yaw_right = False
         self._auto_back = False
@@ -361,9 +357,9 @@ class App(tk.Tk):
 
         # ===== Navigation (logs only) =====
         self.nav_dead_zone_px = NAV_DEAD_ZONE_PX
-        self.last_nav_cmd = None  # tránh spam log
+        self.last_nav_cmd = None
 
-        # ===== Distance Estimation (NEW) =====
+        # ===== Distance Estimation =====
         self.ref_rect = None
         self.ref_area = None
         self.last_distance_state = None
@@ -394,18 +390,24 @@ class App(tk.Tk):
         style.configure("Compact.TLabel", font=("Segoe UI", 9))
         style.configure("Section.TLabel", font=("Segoe UI", 10, "bold"))
         style.configure("Flight.TButton", font=("Segoe UI", 9), padding=(6, 2))
+        style.configure("Foot.TLabel", font=("Segoe UI", 9))
 
     # ---------- Utility ----------
     def log(self, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_queue.put(f"[{ts}] {message}\n")
 
+    def _confirm(self, title, message) -> bool:
+        return messagebox.askyesno(title=title, message=message, parent=self)
+
     def _update_target_controls_state(self):
         enabled_select = (self.show_boxes and not self.lock_target)
-        for b in (self.btn_prev, self.btn_select, self.btn_next):
+        for b in (self.btn_select, self.btn_switch_target):
             b.configure(state=("normal" if enabled_select else "disabled"))
+        # Follow & Approach chỉ khi Auto + có target + OD ON
         follow_enabled = (self.show_boxes and self.selected_id is not None and self.gp.state == ForwardState.OFF)
         self.btn_follow.configure(state=("normal" if follow_enabled else "disabled"))
+        self.btn_approach.configure(state=("normal" if follow_enabled else "disabled"))
 
     def _get_class_for_id(self, tid):
         if tid is None: return None, None
@@ -422,6 +424,8 @@ class App(tk.Tk):
         state = "normal" if enable else "disabled"
         for b in self._flight_btns:
             b.configure(state=state)
+        # Function X chỉ bật ở Auto
+        self.btn_fx.configure(state=state)
         self._update_target_controls_state()
 
     # ---------- Filter helpers ----------
@@ -458,49 +462,89 @@ class App(tk.Tk):
 
         ttk.Frame(root).pack(side="left", fill="both", expand=True)
 
+        # LEFT video
         left = ttk.Frame(root, width=VIDEO_W, height=VIDEO_H)
         left.pack(side="left")
         left.pack_propagate(False)
-
         self.video_canvas = tk.Canvas(left, width=VIDEO_W, height=VIDEO_H, bg="black", highlightthickness=0)
         self.video_canvas.pack()
 
         ttk.Frame(root).pack(side="left", fill="both", expand=True)
 
+        # RIGHT panel with right-edge gap
         right = ttk.Frame(root, width=RIGHT_PANEL_W)
-        right.pack(side="left", fill="y")
+        right.pack(side="left", fill="y", padx=(0, 50))
         right.pack_propagate(False)
 
-        ttk.Frame(root).pack(side="left", fill="both", expand=True)
+        # ---- 1) Flight Mode (top)
+        flight = ttk.Frame(right)
+        self.state_var = tk.StringVar(value=f"Flight Mode: {self.gp.state}")
+        ttk.Label(flight, textvariable=self.state_var, style="Section.TLabel").pack(anchor="w", pady=(0,4))
+        ttk.Button(flight, text="Switch Mode", command=self.toggle_forward,
+                   style="Compact.TButton").pack(fill="x")
 
-        # ===== 1) Target Control =====
-        ttk.Label(right, text="Target Tracking", style="Section.TLabel").pack(anchor="w", pady=(0,4))
-        tc = ttk.Frame(right)
+        # ---- 2) Autonomous Control group
+        ac = ttk.Frame(right)
+        ttk.Label(ac, text="Autonomous Control", style="Section.TLabel").pack(anchor="w", pady=(0,6))
+
+        # Bordered area for navigation buttons
+        nav_border = tk.Frame(ac, highlightbackground="#888", highlightthickness=1, bd=0)
+        nav_border.pack(fill="x", pady=(0,6))
+        fm = ttk.Frame(nav_border, padding=6)
+        fm.pack(fill="x")
+
+        mk = lambda t, cmd: ttk.Button(fm, text=t, command=cmd, style="Flight.TButton", width=10)
+        self.btn_forward = mk("Forward", self.cmd_forward)
+        self.btn_back    = mk("Backward", self.cmd_back)
+        self.btn_up      = mk("Up",      self.cmd_up)
+        self.btn_left    = mk("Left",    self.cmd_left)
+        self.btn_right   = mk("Right",   self.cmd_right)
+        self.btn_down    = mk("Down",    self.cmd_down)
+        self.btn_forward.grid(row=0, column=0, padx=(0,4), pady=(0,4), sticky="ew")
+        self.btn_back.grid(   row=0, column=1, padx=4,     pady=(0,4), sticky="ew")
+        self.btn_up.grid(     row=0, column=2, padx=(4,0), pady=(0,4), sticky="ew")
+        self.btn_left.grid(   row=1, column=0, padx=(0,4), sticky="ew")
+        self.btn_right.grid(  row=1, column=1, padx=4,     sticky="ew")
+        self.btn_down.grid(   row=1, column=2, padx=(4,0), sticky="ew")
+        # Yaw row
+        self.btn_yaw_left  = mk("Yaw Left",  lambda: None)
+        self.btn_yaw_right = mk("Yaw Right", lambda: None)
+        self.btn_yaw_left.grid( row=2, column=0, padx=(0,4), pady=(0,4), sticky="ew")
+        self.btn_yaw_right.grid(row=2, column=1, padx=4,     pady=(0,4), sticky="ew")
+        for c in range(3):
+            fm.grid_columnconfigure(c, weight=1, uniform="fm")
+        self._flight_btns = [
+            self.btn_forward, self.btn_back, self.btn_left, self.btn_right,
+            self.btn_up, self.btn_down, self.btn_yaw_left, self.btn_yaw_right
+        ]
+
+        # ---- Target control row (không tiêu đề)
+        tc = ttk.Frame(ac)
         tc.pack(fill="x", pady=(0,4))
-        self.btn_prev   = ttk.Button(tc, text="◀ A",   command=self.on_key_a, style="Compact.TButton", width=8)
-        self.btn_select = ttk.Button(tc, text="Select", command=self.on_key_s, style="Compact.TButton", width=10)
-        self.btn_next   = ttk.Button(tc, text="D ▶",   command=self.on_key_d, style="Compact.TButton", width=8)
-        self.btn_prev.grid(row=0, column=0, padx=(0,4), pady=(0,2), sticky="ew")
-        self.btn_select.grid(row=0, column=1, padx=2,    pady=(0,2), sticky="ew")
-        self.btn_next.grid(row=0, column=2, padx=(4,0),  pady=(0,2), sticky="ew")
+        self.btn_select = ttk.Button(tc, text="Select", command=self.on_key_s,
+                                     style="Compact.TButton", width=10)
+        self.btn_switch_target = ttk.Button(tc, text="Switch Target",
+                                            command=self.on_switch_target,
+                                            style="Compact.TButton", width=14)
+        self.btn_select.grid(row=0, column=0, padx=(0,4), pady=(0,2), sticky="ew")
+        self.btn_switch_target.grid(row=0, column=1, padx=(4,0), pady=(0,2), sticky="ew")
         tc.grid_columnconfigure(0, weight=1, uniform="tc")
         tc.grid_columnconfigure(1, weight=1, uniform="tc")
-        tc.grid_columnconfigure(2, weight=1, uniform="tc")
 
-        # Toggle OD / Lock
-        toggles = ttk.Frame(right)
+        # Toggles row
+        toggles = ttk.Frame(ac)
         toggles.pack(fill="x", pady=(0,6))
         self.btn_bbox = ttk.Button(toggles, textvariable=self.bbox_btn_var,
-                                   command=self.toggle_bboxes, style="Compact.TButton", width=16)
+                                   command=self.toggle_bboxes, style="Compact.TButton")
         self.btn_lock = ttk.Button(toggles, textvariable=self.lock_btn_var,
-                                   command=self.toggle_lock, style="Compact.TButton", width=14)
+                                   command=self.toggle_lock, style="Compact.TButton")
         self.btn_bbox.grid(row=0, column=0, padx=(0,4), sticky="ew")
         self.btn_lock.grid(row=0, column=1, padx=(4,0), sticky="ew")
         toggles.grid_columnconfigure(0, weight=1, uniform="tog")
         toggles.grid_columnconfigure(1, weight=1, uniform="tog")
 
-        # Combobox lọc
-        filt_row = ttk.Frame(right)
+        # Filter row
+        filt_row = ttk.Frame(ac)
         filt_row.pack(fill="x", pady=(0,6))
         ttk.Label(filt_row, text="Show:", style="Compact.TLabel", width=8).grid(row=0, column=0, sticky="w")
         self.filter_combo = ttk.Combobox(
@@ -514,53 +558,20 @@ class App(tk.Tk):
         filt_row.grid_columnconfigure(1, weight=1)
         self.filter_combo.bind("<<ComboboxSelected>>", self.on_filter_change)
 
-        # ===== 2) Flight Mode =====
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        self.state_var = tk.StringVar(value=f"Flight Mode: {self.gp.state}")
-        ttk.Label(right, textvariable=self.state_var, style="Section.TLabel").pack(anchor="w", pady=(0,4))
-        ttk.Button(right, text="Switch Mode", command=self.toggle_forward,
-                   style="Compact.TButton").pack(fill="x", pady=(0,6))
+        # Follow + NEW buttons (có xác nhận)
+        self.btn_follow = ttk.Button(ac, textvariable=self.follow_btn_var,
+                                     command=self.toggle_follow, style="Compact.TButton")
+        self.btn_follow.pack(fill="x", pady=(0,4))
 
-        fm = ttk.Frame(right)
-        fm.pack(fill="x", pady=(0,6))
-        mk = lambda t, cmd: ttk.Button(fm, text=t, command=cmd, style="Flight.TButton", width=10)
+        self.btn_approach = ttk.Button(ac, text="Target Aproach",
+                                       command=self.cmd_target_approach, style="Compact.TButton")
+        self.btn_approach.pack(fill="x", pady=(0,4))
 
-        self.btn_forward = mk("Forward", self.cmd_forward)
-        self.btn_back    = mk("Backward", self.cmd_back)
-        self.btn_up      = mk("Up",      self.cmd_up)
-        self.btn_left    = mk("Left",    self.cmd_left)
-        self.btn_right   = mk("Right",   self.cmd_right)
-        self.btn_down    = mk("Down",    self.cmd_down)
+        self.btn_fx = ttk.Button(ac, text="Function X",
+                                 command=self.cmd_function_x, style="Compact.TButton")
+        self.btn_fx.pack(fill="x")
 
-        self.btn_forward.grid(row=0, column=0, padx=(0,4), pady=(0,4), sticky="ew")
-        self.btn_back.grid(   row=0, column=1, padx=4,     pady=(0,4), sticky="ew")
-        self.btn_up.grid(     row=0, column=2, padx=(4,0), pady=(0,4), sticky="ew")
-        self.btn_left.grid(   row=1, column=0, padx=(0,4), sticky="ew")
-        self.btn_right.grid(  row=1, column=1, padx=4,     sticky="ew")
-        self.btn_down.grid(   row=1, column=2, padx=(4,0), sticky="ew")
-
-        # Hàng mới: Yaw
-        self.btn_yaw_left  = mk("Yaw Left",  lambda: None)
-        self.btn_yaw_right = mk("Yaw Right", lambda: None)
-        self.btn_yaw_left.grid( row=2, column=0, padx=(0,4), pady=(0,4), sticky="ew")
-        self.btn_yaw_right.grid(row=2, column=1, padx=4,     pady=(0,4), sticky="ew")
-
-        for c in range(3):
-            fm.grid_columnconfigure(c, weight=1, uniform="fm")
-        self._flight_btns = [
-            self.btn_forward, self.btn_back, self.btn_left, self.btn_right, self.btn_up, self.btn_down,
-            self.btn_yaw_left, self.btn_yaw_right
-        ]
-
-        # === Target Follow button ===
-        ttk.Frame(right, height=8).pack(fill="x")
-        self.btn_follow = ttk.Button(
-            right, textvariable=self.follow_btn_var,
-            command=self.toggle_follow, style="Compact.TButton"
-        )
-        self.btn_follow.pack(fill="x", pady=(0,6))
-
-        # Bind press/release để ramp khi ở Auto
+        # Bind press/release cho ramp (Auto)
         self.btn_forward.bind("<ButtonPress-1>", self._forward_press)
         self.btn_forward.bind("<ButtonRelease-1>", self._forward_release)
         self.btn_back.bind("<ButtonPress-1>", self._back_press)
@@ -574,39 +585,50 @@ class App(tk.Tk):
         self.btn_yaw_right.bind("<ButtonPress-1>", self._yaw_right_press)
         self.btn_yaw_right.bind("<ButtonRelease-1>", self._yaw_right_release)
 
-        # ===== 3) Control Parameters =====
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(right, text="Control Parameters", style="Section.TLabel").pack(anchor="w", pady=(0,4))
-        telem = ttk.Frame(right); telem.pack(anchor="w", fill="x")
+        # ---- 3) Control Parameters (ĐÃ CHUYỂN THÀNH BẢNG NGANG)
+        params = ttk.Frame(right)
+        ttk.Label(params, text="Control Parameters", style="Section.TLabel").pack(anchor="w", pady=(0,4))
+        telem = ttk.Frame(params); telem.pack(anchor="w", fill="x")
+
         mono_font = ("Consolas", 10) if os.name=="nt" else ("Menlo", 10)
 
-        ttk.Label(telem, text="Gamepad:", style="Compact.TLabel", width=10).grid(row=0, column=0, sticky="w", padx=(0,6), pady=2)
+        # Hàng Gamepad
+        ttk.Label(telem, text="Gamepad:", style="Compact.TLabel", width=10)\
+            .grid(row=0, column=0, sticky="w", padx=(0,6), pady=2)
         self.pad_name_var = tk.StringVar(value=self.gp.pad_name)
-        ttk.Label(telem, textvariable=self.pad_name_var, style="Compact.TLabel").grid(row=0, column=1, sticky="w", pady=2)
+        ttk.Label(telem, textvariable=self.pad_name_var, style="Compact.TLabel")\
+            .grid(row=0, column=1, columnspan=2, sticky="w", pady=2)
 
-        ttk.Label(telem, text="Physical", style="Compact.TLabel", width=10).grid(row=1, column=0, sticky="w", padx=(0,6), pady=(6,2))
-        ttk.Separator(telem, orient="horizontal").grid(row=1, column=1, sticky="ew", pady=(6,2))
-        for i, name in enumerate(["LX","LY","RX","RY"], start=2):
-            ttk.Label(telem, text=f"{name}:", style="Compact.TLabel", width=6).grid(row=i, column=0, sticky="w")
+        # Header của bảng
+        ttk.Label(telem, text="Axis", style="Compact.TLabel", width=6)\
+            .grid(row=1, column=0, sticky="w", padx=(0,6), pady=(6,2))
+        ttk.Label(telem, text="Physical", style="Compact.TLabel", width=10)\
+            .grid(row=1, column=1, sticky="w", padx=(0,6), pady=(6,2))
+        ttk.Label(telem, text="Virtual", style="Compact.TLabel", width=10)\
+            .grid(row=1, column=2, sticky="w", padx=(0,0),  pady=(6,2))
+
+        # Các hàng dữ liệu
+        axes = ["LX","LY","RX","RY"]
         self.real_vars = [tk.StringVar(value="+0.000") for _ in range(4)]
-        for i, v in enumerate(self.real_vars, start=2):
-            tk.Label(telem, textvariable=v, font=mono_font, width=7, anchor="e").grid(row=i, column=1, sticky="w")
-
-        ttk.Label(telem, text="Virtual", style="Compact.TLabel", width=10).grid(row=6, column=0, sticky="w", padx=(0,6), pady=(6,2))
-        ttk.Separator(telem, orient="horizontal").grid(row=6, column=1, sticky="ew", pady=(6,2))
-        for i, name in enumerate(["LX","LY","RX","RY"], start=7):
-            ttk.Label(telem, text=f"{name}:", style="Compact.TLabel", width=6).grid(row=i, column=0, sticky="w")
         self.virt_vars = [tk.StringVar(value="+0.000") for _ in range(4)]
-        for i, v in enumerate(self.virt_vars, start=7):
-            tk.Label(telem, textvariable=v, font=mono_font, width=7, anchor="e").grid(row=i, column=1, sticky="w")
+
+        for i, name in enumerate(axes):
+            r = 2 + i
+            ttk.Label(telem, text=f"{name}:", style="Compact.TLabel", width=6)\
+                .grid(row=r, column=0, sticky="w", padx=(0,6))
+            tk.Label(telem, textvariable=self.real_vars[i], font=mono_font, width=7, anchor="e")\
+                .grid(row=r, column=1, sticky="w")
+            tk.Label(telem, textvariable=self.virt_vars[i], font=mono_font, width=7, anchor="e")\
+                .grid(row=r, column=2, sticky="w")
 
         telem.grid_columnconfigure(0, weight=0)
         telem.grid_columnconfigure(1, weight=1)
+        telem.grid_columnconfigure(2, weight=1)
 
-        # ===== 4) Logs =====
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(right, text="Logs", style="Section.TLabel").pack(anchor="w", pady=(0,4))
-        log_holder = ttk.Frame(right, height=110)
+        # ---- 4) Logs
+        logs = ttk.Frame(right)
+        ttk.Label(logs, text="Logs", style="Section.TLabel").pack(anchor="w", pady=(0,4))
+        log_holder = ttk.Frame(logs, height=110)
         log_holder.pack(fill="x", expand=False)
         log_holder.pack_propagate(False)
         self.log_text = tk.Text(log_holder, height=5, wrap="word", state="disabled")
@@ -615,18 +637,28 @@ class App(tk.Tk):
         log_scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-        # ===== 5) Shortcuts =====
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(
-            right,
-            text="ESC: Quit | S: select/clear | A/D: prev/next | Toggles: OD / Lock / Follow",
-            style="Compact.TLabel",
-            wraplength=RIGHT_PANEL_W-16, justify="left"
-        ).pack(anchor="w")
+        # ---- 5) FPS (thay cho Shortcuts, đặt dưới cùng)
+        fps_panel = ttk.Frame(right)
+        ttk.Label(fps_panel, textvariable=self.fps_var, style="Foot.TLabel").pack(anchor="w")
+
+        # ---- Even spacers layout in right column ----
+        sections = [flight, ac, params, logs, fps_panel]
+        row = 0
+        for sect in sections:
+            spacer = ttk.Frame(right)
+            spacer.grid(row=row, column=0, sticky="nsew")
+            right.grid_rowconfigure(row, weight=1)
+            row += 1
+            sect.grid(row=row, column=0, sticky="nsew", padx=0)
+            right.grid_rowconfigure(row, weight=0)
+            row += 1
+        spacer = ttk.Frame(right)
+        spacer.grid(row=row, column=0, sticky="nsew")
+        right.grid_rowconfigure(row, weight=1)
+        right.grid_columnconfigure(0, weight=1)
 
     # ---------- Logic ----------
     def toggle_forward(self):
-        # Cycle: Manual (ON) -> Auto (OFF) -> Arming -> Manual (ON)
         prev = self.gp.state
         self.gp.state = ForwardState.ON if prev == ForwardState.ARMING \
                         else (ForwardState.ARMING if prev == ForwardState.OFF else ForwardState.OFF)
@@ -634,7 +666,6 @@ class App(tk.Tk):
         self._update_flight_mode_controls()
         self.log(f"Flight Mode -> {self.gp.state}")
 
-        # Rời Auto -> tắt Follow ngay + clear auto-hold
         if prev == ForwardState.OFF and self.gp.state in (ForwardState.ARMING, ForwardState.ON):
             if self.target_follow:
                 self.target_follow = False
@@ -643,7 +674,6 @@ class App(tk.Tk):
             self._clear_auto_holds()
             self._stop_ramp()
 
-        # Vào Auto: chụp LY hiện tại để giữ nguyên trong Auto
         if self.gp.state == ForwardState.OFF:
             self.auto_ly_hold = float(self.gp.v_ly)
             self.log(f"Auto mode: hold LY = {self.auto_ly_hold:+.3f}")
@@ -653,10 +683,8 @@ class App(tk.Tk):
     def _clear_auto_holds(self):
         changed = any([self._auto_left, self._auto_right, self._auto_yaw_left,
                        self._auto_yaw_right, self._auto_back, self._auto_forward])
-        # Giữ yaw/forward/back nếu có; KHÔNG dùng _auto_left/_auto_right cho RX nữa
-        self._auto_left = self._auto_right = False  # vô hiệu hóa tự động RX triệt để
+        self._auto_left = self._auto_right = False
         self._nav_left_until = self._nav_right_until = 0.0
-        # các hướng khác giữ nguyên timers (dưới)
         if self._auto_yaw_left or self._auto_yaw_right or self._auto_back or self._auto_forward:
             changed = True
         self._nav_back_until = 0.0
@@ -723,7 +751,6 @@ class App(tk.Tk):
         self._update_target_controls_state()
 
     def toggle_follow(self):
-        # Chỉ cho phép khi Flight Mode = Auto (OFF)
         if self.gp.state != ForwardState.OFF:
             self.target_follow = False
             self.follow_btn_var.set("Target Follow: OFF")
@@ -743,6 +770,12 @@ class App(tk.Tk):
             self._update_target_controls_state()
             return
 
+        if not self.target_follow:
+            ok = self._confirm("Warning !", "Target Follow?")
+            if not ok:
+                self.log("Target Follow -> cancelled by user")
+                return
+
         self.target_follow = not self.target_follow
         self.follow_btn_var.set(f"Target Follow: {'ON' if self.target_follow else 'OFF'}")
         if self.target_follow:
@@ -754,7 +787,26 @@ class App(tk.Tk):
             self.last_nav_cmd = None
             self._clear_auto_holds()
 
-    # --- Selection handlers ---
+    def cmd_target_approach(self):
+        if self.gp.state != ForwardState.OFF or not self.show_boxes or self.selected_id is None:
+            self.log("Target Aproach: yêu cầu Auto mode + OD ON + đã chọn target")
+            return
+        if not self._confirm("Warning !", "Target Aproach?"):
+            self.log("Target Aproach -> cancelled by user")
+            return
+        self.log(f"Target Aproach pressed (ID={self.selected_id}) - placeholder")
+
+    def cmd_function_x(self):
+        # CHỈ cho phép ở Auto
+        if self.gp.state != ForwardState.OFF:
+            self.log("Function X: yêu cầu Flight Mode = Auto")
+            return
+        if not self._confirm("Xác nhận", "Thực thi Function X?"):
+            self.log("Function X -> cancelled by user")
+            return
+        self.log("Function X pressed - placeholder for future code")
+
+    # --- Selection handlers / Switch Target ---
     def on_key_s(self):
         if not self.show_boxes:
             self.log("Blocked: Object Detection is OFF (S)")
@@ -787,7 +839,34 @@ class App(tk.Tk):
             self.log("No available targets to select")
         self._update_target_controls_state()
 
+    def on_switch_target(self):
+        if not self.show_boxes:
+            self.log("Blocked: Object Detection is OFF (Switch Target)")
+            self.log("No target is currently selected")
+            return
+        if self.lock_target:
+            self.log("Blocked: Target Lock is active (Switch Target)")
+            return
+        if not self.available_ids:
+            self.log("No available targets")
+            return
+
+        if self.selected_id is None:
+            self.selected_id = self.available_ids[0]
+        else:
+            nh = next_higher(self.available_ids, self.selected_id)
+            self.selected_id = nh if nh is not None else self.available_ids[0]
+
+        cls_id, cls_name = self._get_class_for_id(self.selected_id)
+        self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
+        self.log(f"Selected target ID={self.selected_id}")
+        self.last_nav_cmd = None
+        self._clear_auto_holds()
+        self.last_distance_state = None
+        self._update_target_controls_state()
+
     def on_key_d(self):
+        # vẫn giữ phím D như chuyển kế tiếp (nếu dùng)
         if not self.show_boxes:
             self.log("Blocked: Object Detection is OFF (D)")
             self.log("No target is currently selected")
@@ -800,10 +879,7 @@ class App(tk.Tk):
                 self.selected_id = self.available_ids[0]
             else:
                 nh = next_higher(self.available_ids, self.selected_id)
-                if nh:
-                    self.selected_id = nh
-                else:
-                    self.log("No higher ID available"); return
+                self.selected_id = nh if nh is not None else self.available_ids[0]
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
             self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
             self.log(f"Selected target ID={self.selected_id}")
@@ -815,6 +891,7 @@ class App(tk.Tk):
         self._update_target_controls_state()
 
     def on_key_a(self):
+        # A sẽ chọn ID nhỏ nhất
         if not self.show_boxes:
             self.log("Blocked: Object Detection is OFF (A)")
             self.log("No target is currently selected")
@@ -823,14 +900,7 @@ class App(tk.Tk):
             self.log("Blocked: Target Lock is active (A)")
             return
         if self.available_ids:
-            if self.selected_id is None:
-                self.selected_id = self.available_ids[0]
-            else:
-                nl = next_lower(self.available_ids, self.selected_id)
-                if nl:
-                    self.selected_id = nl
-                else:
-                    self.log("No lower ID available"); return
+            self.selected_id = self.available_ids[0]
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
             self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
             self.log(f"Selected target ID={self.selected_id}")
@@ -913,20 +983,15 @@ class App(tk.Tk):
         if self.gp.state != ForwardState.OFF:
             return
 
-        # ===== Combine manual + auto flags =====
-        # >>> RX: BỎ HẲN AUTO — chỉ manual mới ảnh hưởng RX
-        right_eff = self._right_holding                 # no self._auto_right
-        left_eff  = self._left_holding                  # no self._auto_left
+        right_eff = self._right_holding
+        left_eff  = self._left_holding
 
-        # Yaw (LX) vẫn có auto-hold
         yaw_r_eff = self._yaw_right_holding or self._auto_yaw_right
         yaw_l_eff = self._yaw_left_holding  or self._auto_yaw_left
 
-        # Forward/Backward (RY) vẫn có auto-hold (khoảng cách)
         back_eff  = self._back_holding or self._auto_back
         fwd_eff   = self._forward_holding or self._auto_forward
 
-        # Targets
         if right_eff and not left_eff:     target_rx = +self.RX_CAP
         elif left_eff and not right_eff:   target_rx = -self.RX_CAP
         else:                              target_rx = 0.0
@@ -939,7 +1004,6 @@ class App(tk.Tk):
         elif back_eff and not fwd_eff:     target_ry = -self.RY_CAP
         else:                              target_ry = 0.0
 
-        # Ramp
         if self.auto_ry < target_ry: self.auto_ry = min(target_ry, self.auto_ry + self.RY_STEP)
         elif self.auto_ry > target_ry: self.auto_ry = max(target_ry, self.auto_ry - self.RY_STEP)
 
@@ -969,12 +1033,9 @@ class App(tk.Tk):
                 self.cv_tracker = None
 
     def _apply_auto_nav_holds(self):
-        """UI thread: apply/release auto holds based on timers & state."""
         now = time.monotonic()
-        # Only in Auto + Follow ON
         if self.gp.state != ForwardState.OFF or not self.target_follow:
             if any([self._auto_left, self._auto_right, self._auto_yaw_left, self._auto_yaw_right, self._auto_back, self._auto_forward]):
-                # dọn sạch auto flags; RX auto đã vô hiệu hoá ở ramp_tick
                 self._auto_left = self._auto_right = False
                 self._auto_yaw_left = self._auto_yaw_right = False
                 self._auto_back = self._auto_forward = False
@@ -985,14 +1046,12 @@ class App(tk.Tk):
         desired_auto_back    = (now < self._nav_back_until)
         desired_auto_forward = (now < self._nav_forward_until)
 
-        # Exclusivity trái/phải cho Yaw (không ảnh hưởng RX)
         if desired_auto_left and desired_auto_right:
             if self._nav_left_until >= self._nav_right_until:
                 desired_auto_right = False
             else:
                 desired_auto_left = False
 
-        # Exclusivity tiến/lùi
         if desired_auto_forward and desired_auto_back:
             if self._nav_forward_until >= self._nav_back_until:
                 desired_auto_back = False
@@ -1000,8 +1059,6 @@ class App(tk.Tk):
                 desired_auto_forward = False
 
         changed = False
-        # === Chỉ kích hoạt YAW tự động; KHÔNG kích hoạt RX tự động ===
-        # Left group -> chỉ yaw_left
         if desired_auto_left:
             if not self._auto_yaw_left:
                 self._auto_yaw_left = True; changed = True
@@ -1011,7 +1068,6 @@ class App(tk.Tk):
             if self._auto_yaw_left:
                 self._auto_yaw_left = False; changed = True
 
-        # Right group -> chỉ yaw_right
         if desired_auto_right:
             if not self._auto_yaw_right:
                 self._auto_yaw_right = True; changed = True
@@ -1021,11 +1077,6 @@ class App(tk.Tk):
             if self._auto_yaw_right:
                 self._auto_yaw_right = False; changed = True
 
-        # >>> Không bao giờ bật _auto_left/_auto_right (RX auto) <<<
-        if self._auto_left or self._auto_right:
-            self._auto_left = self._auto_right = False; changed = True
-
-        # Forward/backward (khoảng cách)
         if desired_auto_forward:
             if not self._auto_forward:
                 self._auto_forward = True; changed = True
@@ -1047,10 +1098,9 @@ class App(tk.Tk):
         if changed:
             self._start_ramp_loop()
 
-    # ===== Distance Estimation helpers (NEW) =====
+    # ===== Distance Estimation helpers =====
     def _init_reference_rect(self, frame_w, frame_h):
-        """Tạo hình chữ nhật trung tâm làm tham chiếu cho khoảng cách."""
-        w, h = int(frame_w * 0.5), int(frame_h * 0.75)  # "vừa phải"
+        w, h = int(frame_w * 0.3), int(frame_h * 0.5)
         cx, cy = frame_w // 2, frame_h // 2
         x1, y1 = cx - w // 2, cy - h // 2
         x2, y2 = cx + w // 2, cy + h // 2
@@ -1059,7 +1109,6 @@ class App(tk.Tk):
         self.log(f"Reference rectangle initialized: area={self.ref_area}")
 
     def _estimate_distance_state(self, current_box):
-        """So sánh diện tích box hiện tại với hình tham chiếu; trả về (state, ratio)."""
         if self.ref_rect is None or current_box is None:
             return None, None
         x1, y1, x2, y2 = current_box
@@ -1084,12 +1133,21 @@ class App(tk.Tk):
         gen = self.model.track(source=CAM_INDEX, conf=CONF_THRES,
                                device="cuda" if USE_GPU else "cpu",
                                classes=CLASSES, tracker=TRACKER_CFG,
-                               persist=PERSIST_ID, stream=True, verbose=False)
+                               persist=PERSIST_ID, stream=True, verbose=False, half=True)
         while self.running:
             try:
                 res = next(gen)
             except Exception:
                 continue
+
+            # ===== FPS counting =====
+            self._fps_frame_count += 1
+            now = time.monotonic()
+            dt = now - self._fps_last_time
+            if dt >= 1.0:
+                self._fps_value = self._fps_frame_count / dt
+                self._fps_frame_count = 0
+                self._fps_last_time = now
 
             # Collect tracks
             self.last_tracks = {}
@@ -1133,7 +1191,7 @@ class App(tk.Tk):
                         self.pred.update_with_detection(id_to_box[sig_id])
                         self._reinint_tracker_for_selected(res.orig_img, id_to_box[sig_id])
 
-            # Handle selected target with enhanced persistence
+            # Handle selected target
             current_target_box = None
             if self.show_boxes and self.selected_id is not None:
                 sel_id = int(self.selected_id)
@@ -1217,43 +1275,34 @@ class App(tk.Tk):
             frame = res.orig_img.copy()
             frame_h, frame_w = frame.shape[:2]
 
-            # Khởi tạo khung tham chiếu 1 lần
             if self.ref_rect is None:
                 self._init_reference_rect(frame_w, frame_h)
 
             frame = draw_tracks(frame, res, self.selected_id, self.names,
                                 show=self.show_boxes, allowed_classes=self.display_allowed)
 
-            # vẽ ghost box nếu đang bridge
             if self.show_boxes and self.selected_id is not None and self.pred.active:
                 label = "TRACK" if (self.cv_tracker is not None and self.predicted_box is not None) else "PRED"
                 frame = draw_predicted_box(frame, self.predicted_box, label=label)
 
-            # Vẽ khung tham chiếu (tùy chọn)
             frame = self._draw_reference_rect(frame, color=(220, 220, 220))
-
-            # Crosshair trung tâm (luôn bật)
             draw_crosshair_center(frame, size=CROSSHAIR_CENTER_SIZE, color=(255, 0, 0))
 
-            # ===== Follow logic: chỉ Yaw auto; RX không auto; RY dựa khoảng cách =====
             if self.target_follow and self.gp.state == ForwardState.OFF and current_target_box is not None:
                 x1,y1,x2,y2 = current_target_box
                 cx_obj, cy_obj = int((x1+x2)//2), int((y1+y2)//2)
                 draw_crosshair_at(frame, cx_obj, cy_obj, size=CROSSHAIR_TARGET_SIZE, color=(0, 255, 255))
                 dx = cx_obj - (frame_w//2)
 
-                # Chỉ sinh lệnh L/R để phục vụ Yaw (không tác động RX auto)
                 horiz = None
                 if abs(dx) > self.nav_dead_zone_px:
                     horiz = "Right" if dx > 0 else "Left"
 
-                # Log ngắn gọn (chỉ LR)
                 cmd_text = horiz if horiz else "Hold"
                 if cmd_text != self.last_nav_cmd:
                     self.log(f"NAV CMD -> {cmd_text}")
                     self.last_nav_cmd = cmd_text
 
-                # ====== Timers cho yaw (tận dụng left/right timers cũ) ======
                 now = time.monotonic()
                 if horiz == "Right":
                     self._nav_right_until = now + 1.0
@@ -1262,7 +1311,6 @@ class App(tk.Tk):
                     self._nav_left_until = now + 1.0
                     self._nav_right_until = 0.0
 
-                # ====== Distance-based Forward/Backward ======
                 dist_state, ratio = self._estimate_distance_state(current_target_box)
                 if dist_state is not None:
                     if dist_state != self.last_distance_state:
@@ -1274,7 +1322,6 @@ class App(tk.Tk):
                     elif dist_state == "Too Close":
                         self._nav_back_until = now + 1.0
                         self._nav_forward_until = 0.0
-                    # Near -> không gia hạn, để timer tự hết
             else:
                 if self.last_nav_cmd is not None and (not self.target_follow or self.gp.state != ForwardState.OFF):
                     self.last_nav_cmd = None
@@ -1295,14 +1342,15 @@ class App(tk.Tk):
         self._update_flight_mode_controls()
         self.pad_name_var.set(self.gp.pad_name)
 
-        # Apply auto-holds (based on timers & state)
+        # cập nhật FPS ở panel cuối cột phải
+        self.fps_var.set(f"FPS: {self._fps_value:0.1f}")
+
         self._apply_auto_nav_holds()
 
         vals = [self.gp.r_lx, self.gp.r_ly, self.gp.r_rx, self.gp.r_ry]
         for var, v in zip(self.real_vars, vals):
             var.set(f"{v:+.3f}")
 
-        # Ở Auto: LY giữ snapshot; LX/RX/RY theo ramp
         if self.gp.state == ForwardState.OFF:
             ry_float = max(-self.RY_CAP, min(self.RY_CAP, self.auto_ry))
             rx_float = max(-self.RX_CAP, min(self.RX_CAP, self.auto_rx))

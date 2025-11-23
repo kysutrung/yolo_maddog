@@ -55,7 +55,7 @@ MIN_AREA_REACQ      = 200
 # =====================================================
 
 # ======== Navigation without on-frame text ========
-NAV_DEAD_ZONE_PX      = 70
+NAV_DEAD_ZONE_PX      = 110
 CROSSHAIR_CENTER_SIZE = 6
 CROSSHAIR_TARGET_SIZE = 6
 # =====================================================
@@ -308,11 +308,11 @@ class App(tk.Tk):
         # log queue
         self.log_queue = queue.Queue()
 
-        # styles
+        # styles    
         self._init_styles()
 
         # ---- Auto ramp settings ----
-        self.RY_CAP = 0.200; self.RY_STEP = 0.05
+        self.RY_CAP = 0.300; self.RY_STEP = 0.05
         self.RX_CAP = 0.15; self.RX_STEP = 0.05
         self.LX_CAP = 0.15; self.LX_STEP = 0.05
 

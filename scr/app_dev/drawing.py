@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 
-from .config import CROSSHAIR_CENTER_SIZE, CROSSHAIR_TARGET_SIZE
+from config import CROSSHAIR_CENTER_SIZE, CROSSHAIR_TARGET_SIZE
 
 def draw_tracks(frame, res, selected_id, names, show=True, allowed_classes=None):
     if not show or res.boxes is None or len(res.boxes) == 0:

@@ -2,10 +2,11 @@
 import cv2
 import numpy as np
 
-from .config import USE_CV_TRACKER, CV_TRACKER_TYPE
-from .utils import box_center, clip_box_to_frame
+from config import CV_TRACKER_TYPE
+from utils import box_center, clip_box_to_frame
 
 def compute_hist(image, bbox_xyxy):
+    """Compute normalized HSV histogram for a bounding box region."""
     x1, y1, x2, y2 = [max(0, int(v)) for v in bbox_xyxy]
     x2 = min(x2, image.shape[1])
     y2 = min(y2, image.shape[0])
@@ -28,6 +29,7 @@ def cosine_sim(a, b):
     return float(np.dot(a, b) / den)
 
 def make_cv_tracker(name=CV_TRACKER_TYPE):
+    """Create an OpenCV tracker instance."""
     legacy = getattr(cv2, "legacy", None)
     n = (name or "CSRT").upper()
     if n == "CSRT":
@@ -36,9 +38,11 @@ def make_cv_tracker(name=CV_TRACKER_TYPE):
         return legacy.TrackerKCF_create() if legacy and hasattr(legacy, "TrackerKCF_create") else cv2.TrackerKCF_create()
     if n == "MOSSE":
         return legacy.TrackerMOSSE_create() if legacy and hasattr(legacy, "TrackerMOSSE_create") else cv2.TrackerMOSSE_create()
+    # default
     return legacy.TrackerCSRT_create() if legacy and hasattr(legacy, "TrackerCSRT_create") else cv2.TrackerCSRT_create()
 
 class GapPredictor:
+    """Predict bounding box when detections are temporarily missing."""
     def __init__(self, frame_size, max_gap=12, damping=0.88):
         self.W, self.H = frame_size
         self.max_gap = int(max_gap)
@@ -58,8 +62,10 @@ class GapPredictor:
         if self.last_center is not None:
             vx = c[0] - self.last_center[0]
             vy = c[1] - self.last_center[1]
-            self.vel = (0.6 * vx + 0.4 * self.vel[0],
-                        0.6 * vy + 0.4 * self.vel[1])
+            self.vel = (
+                0.6 * vx + 0.4 * self.vel[0],
+                0.6 * vy + 0.4 * self.vel[1],
+            )
         self.last_box = (x1, y1, x2, y2)
         self.last_center = c
         self.gap = 0
@@ -75,6 +81,7 @@ class GapPredictor:
         vx, vy = self.vel
         x1, y1, x2, y2 = self.last_box
         grow = 1.0 + 0.008 * (self.gap + 1)
+
         cx, cy = box_center(x1, y1, x2, y2)
         w = (x2 - x1) * grow
         h = (y2 - y1) * grow

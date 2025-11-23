@@ -1,7 +1,7 @@
 # config.py
 
 # =================== Configuration ===================
-WEIGHTS        = "yolo_weights/yolov8m.engine"
+WEIGHTS        = "yolo_weights/yolov8m.pt"
 USE_GPU        = True
 CONF_THRES     = 0.30
 CLASSES        = [0, 2, 3]
@@ -11,10 +11,12 @@ SAVE_OUTPUT    = False
 CAM_INDEX      = 0
 TARGET_FPS     = 30
 
+# Gamepad axes & thresholds
 AX_LX, AX_LY, AX_RY, AX_RX = 0, 1, 2, 3
 DEADZONE, ARM_EPS = 0.08, 0.05
 SWAP_REAL_LR  = True
 
+# Window & layout
 WIN_TITLE        = "YOLO Mad Dog Control Panel By TrungTauLua"
 START_FULLSCREEN = False
 VIDEO_W, VIDEO_H = 1024, 768

@@ -1,10 +1,6 @@
 # main.py
-
-from mad_dog_control.app import App
-
-def main():
-    app = App()
-    app.mainloop()
+from app import App
 
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.mainloop()

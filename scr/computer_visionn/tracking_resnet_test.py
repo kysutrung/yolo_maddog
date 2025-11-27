@@ -1,332 +1,366 @@
 import cv2
 import numpy as np
 import torch
-from torchvision import models
+import torch.nn as nn
+from torchvision import models, transforms
 from ultralytics import YOLO
+from filterpy.kalman import KalmanFilter
+from scipy.optimize import linear_sum_assignment
 
-# ===================== CẤU HÌNH ===================== #
-YOLO_WEIGHTS = "yolo_weights/yolov8m.engine"  # đường dẫn model YOLO của bạn
-CONF_THRES = 0.3                              # ngưỡng confidence của YOLO
+# ============================================================
+#        FEATURE EXTRACTOR (ResNet50 – No TorchReID)
+# ============================================================
 
-EMB_SIM_THRESHOLD = 0.7                       # ngưỡng cosine similarity để coi là cùng mục tiêu
-TARGET_ABS_ID = 1                             # ID tuyệt đối cho mục tiêu
+class ResNet50Extractor:
+    def __init__(self, device="cuda"):
+        self.device = device
+        base = models.resnet50(weights="IMAGENET1K_V2")
+        base.fc = nn.Identity()  # output 2048-D vector
+        self.model = base.to(device).eval()
 
-# ImageNet mean/std cho normalize
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        self.tf = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((256, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
 
-
-# ===================== MẠNG TRÍCH ĐẶC TRƯNG ===================== #
-def build_feature_extractor(device):
-    """
-    Tạo ResNet18 pre-trained, bỏ lớp FC cuối để lấy vector đặc trưng 512-D.
-    """
-    backbone = models.resnet18(pretrained=True)
-    backbone.fc = torch.nn.Identity()  # output shape: [B, 512]
-    backbone.to(device)
-    backbone.eval()
-    return backbone
-
-
-def compute_embedding(roi_bgr, backbone, device):
-    """
-    Tính embedding deep cho ROI (BGR -> RGB -> resize 224 -> normalize -> ResNet).
-    Trả về vector 512-D đã L2-normalize (numpy array).
-    """
-    if roi_bgr is None or roi_bgr.size == 0:
-        return None
-
-    # BGR -> RGB
-    roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-
-    # Resize về 224x224
-    roi_resized = cv2.resize(roi_rgb, (224, 224))
-
-    # HWC -> CHW, [0,255] -> [0,1]
-    tensor = torch.from_numpy(roi_resized).permute(2, 0, 1).float() / 255.0
-
-    # Normalize theo ImageNet
-    tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
-    tensor = tensor.unsqueeze(0).to(device)  # thêm batch dim
-
-    with torch.no_grad():
-        feat = backbone(tensor)  # [1, 512]
-        feat = feat[0]           # [512]
-        feat = feat / (feat.norm(p=2) + 1e-8)
-
-    return feat.cpu().numpy()
+    @torch.no_grad()
+    def __call__(self, img):
+        if img is None or img.size == 0:
+            return None
+        img = self.tf(img).unsqueeze(0).to(self.device)
+        feat = self.model(img)[0]
+        feat = feat / (feat.norm() + 1e-8)
+        return feat.cpu().numpy()
 
 
-# ===================== HÀM TIỆN ÍCH ===================== #
-def safe_crop(frame, box):
-    """
-    Cắt ROI theo box (x1, y1, x2, y2) nhưng đảm bảo không vượt khỏi frame.
-    Trả về None nếu box không hợp lệ.
-    """
-    x1, y1, x2, y2 = box
-    h, w = frame.shape[:2]
+# ============================================================
+#                  MEMORY RE-ID (Signature)
+# ============================================================
 
-    x1 = max(0, min(x1, w - 1))
-    x2 = max(0, min(x2, w - 1))
-    y1 = max(0, min(y1, h - 1))
-    y2 = max(0, min(y2, h - 1))
+class TargetMemory:
+    def __init__(self, max_samples=20):
+        self.embeds = []
+        self.max_samples = max_samples
 
-    if x2 <= x1 or y2 <= y1:
-        return None
+    def add(self, emb):
+        if emb is None:
+            return
+        self.embeds.append(emb)
+        if len(self.embeds) > self.max_samples:
+            self.embeds.pop(0)
 
-    return frame[y1:y2, x1:x2]
-
-
-def get_detections(results):
-    """
-    Chuyển output YOLO Results thành list bounding boxes:
-    [(x1, y1, x2, y2, conf, cls_id), ...]
-    """
-    detections = []
-    boxes = results.boxes
-
-    if boxes is None:
-        return detections
-
-    xyxy = boxes.xyxy.cpu().numpy()
-    confs = boxes.conf.cpu().numpy()
-    clss = boxes.cls.cpu().numpy()
-
-    for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, clss):
-        detections.append((
-            int(x1), int(y1), int(x2), int(y2),
-            float(conf), int(cls_id)
-        ))
-
-    return detections
+    def signature(self):
+        if len(self.embeds) == 0:
+            return None
+        sig = np.mean(self.embeds, axis=0)
+        sig /= (np.linalg.norm(sig) + 1e-8)
+        return sig
 
 
-# ===================== CHƯƠNG TRÌNH CHÍNH ===================== #
+# ============================================================
+#           DRONE SAFE KALMAN TRACKER (No NaN)
+# ============================================================
+
+class KalmanBoxTracker:
+    count = 0
+
+    def __init__(self, bbox):
+
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+
+        self.kf.F = np.array([
+            [1,0,0,0,1,0,0],
+            [0,1,0,0,0,1,0],
+            [0,0,1,0,0,0,1],
+            [0,0,0,1,0,0,0],
+            [0,0,0,0,1,0,0],
+            [0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,1]
+        ])
+
+        self.kf.H = np.array([
+            [1,0,0,0,0,0,0],
+            [0,1,0,0,0,0,0],
+            [0,0,1,0,0,0,0],
+            [0,0,0,1,0,0,0]
+        ])
+
+        self.kf.P *= 10
+        self.kf.R *= 1
+        self.kf.Q *= 0.01
+
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        s = max((x2-x1)*(y2-y1), 1e-6)
+        r = max((x2-x1)/(y2-y1+1e-6), 0.1)
+
+        self.kf.x[:4] = np.array([[cx], [cy], [s], [r]])
+
+        self.time_since_update = 0
+        self.hits = 1
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+
+        self.last_feat = None
+        self.predicted_box = bbox
+        self.memory = TargetMemory()
+
+    def predict(self):
+        self.kf.predict()
+
+        if self.kf.x[2] < 1e-6:
+            self.kf.x[2] = 1e-6
+        if self.kf.x[3] < 0.1:
+            self.kf.x[3] = 1.0
+
+        self.time_since_update += 1
+        self.predicted_box = self.state()
+        return self.predicted_box
+
+    def update(self, bbox):
+        x1, y1, x2, y2 = bbox
+
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        s = max((x2-x1)*(y2-y1), 1e-6)
+        r = max((x2-x1)/(y2-y1+1e-6), 0.1)
+
+        z = np.array([[cx], [cy], [s], [r]])
+        self.kf.update(z)
+
+        self.hits += 1
+        self.time_since_update = 0
+
+    def state(self):
+        cx, cy, s, r = self.kf.x[:4].reshape(-1)
+
+        s = max(s, 1e-6)
+        r = max(r, 0.1)
+
+        w = np.sqrt(s * r)
+        h = s / (w + 1e-6)
+
+        if np.isnan(w) or np.isnan(h) or w <= 0 or h <= 0:
+            w, h = 50, 100
+
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+
+        return [int(x1), int(y1), int(x2), int(y2)]
+
+
+# ============================================================
+#                     DRONE TRACKER PRO 2.0
+# ============================================================
+
+class DroneTrackerPro:
+    def __init__(self, device="cuda"):
+        self.device = device
+        self.extractor = ResNet50Extractor(device)
+        self.trackers = []
+
+        self.base_thr = 0.65
+        self.adapt_low = 0.55
+        self.max_age = 120
+
+        self.target_id = None
+        self.target_sig = None
+
+    def iou(self, a, b):
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        w = max(0, x2-x1)
+        h = max(0, y2-y1)
+        inter = w*h
+        areaA = (a[2]-a[0])*(a[3]-a[1])
+        areaB = (b[2]-b[0])*(b[3]-b[1])
+        return inter / (areaA + areaB - inter + 1e-6)
+
+    def update(self, dets, frame):
+        feats = []
+        for (x1, y1, x2, y2, conf, cls) in dets:
+            feats.append(self.extractor(frame[y1:y2, x1:x2]))
+
+        for t in self.trackers:
+            t.predict()
+
+        if len(self.trackers) == 0:
+            for i, det in enumerate(dets):
+                tr = KalmanBoxTracker(det[:4])
+                tr.last_feat = feats[i]
+                tr.memory.add(feats[i])
+                self.trackers.append(tr)
+        else:
+            N = len(self.trackers)
+            M = len(dets)
+            cost = np.ones((N, M), dtype=np.float32)
+
+            for i, trk in enumerate(self.trackers):
+                pred = trk.predicted_box
+
+                for j, feat in enumerate(feats):
+                    cos = 0
+                    if trk.last_feat is not None and feat is not None:
+                        cos = np.dot(trk.last_feat, feat)
+                        cos = (cos + 1) / 2
+
+                    iou = self.iou(pred, dets[j][:4])
+
+                    # center similarity
+                    bx1, by1, bx2, by2 = pred
+                    cx = (bx1 + bx2) / 2
+                    cy = (by1 + by2) / 2
+                    tx = (dets[j][0] + dets[j][2]) / 2
+                    ty = (dets[j][1] + dets[j][3]) / 2
+                    center_sim = np.exp(-0.0005 * ((tx-cx)**2 + (ty-cy)**2))
+
+                    score = 0.65*cos + 0.25*iou + 0.10*center_sim
+
+                    # nếu là target → dùng signature mạnh hơn
+                    if trk.id == self.target_id and self.target_sig is not None:
+                        sig_cos = np.dot(self.target_sig, feat)
+                        sig_cos = (sig_cos + 1) / 2
+                        score = max(score, sig_cos)
+
+                    cost[i, j] = 1 - score
+
+            row, col = linear_sum_assignment(cost)
+            matched = set()
+
+            for r, c in zip(row, col):
+                thr = self.adapt_low if self.trackers[r].hits > 20 else self.base_thr
+
+                if cost[r, c] < (1 - thr):
+                    self.trackers[r].update(dets[c][:4])
+                    self.trackers[r].last_feat = feats[c]
+                    self.trackers[r].memory.add(feats[c])
+                    if self.trackers[r].id == self.target_id:
+                        self.target_sig = self.trackers[r].memory.signature()
+                    matched.add(c)
+
+            for j in range(len(dets)):
+                if j not in matched:
+                    tr = KalmanBoxTracker(dets[j][:4])
+                    tr.last_feat = feats[j]
+                    tr.memory.add(feats[j])
+                    self.trackers.append(tr)
+
+        self.trackers = [
+            t for t in self.trackers if t.time_since_update < self.max_age
+        ]
+
+        out = []
+        for t in self.trackers:
+            out.append((t.id, *t.state(), t.time_since_update))
+        return out
+
+
+# ============================================================
+#                          MAIN
+# ============================================================
+
 def main():
-    # Thiết bị cho ResNet
+
+    model = YOLO("yolo_weights/yolov8m.pt")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Dùng device cho feature extractor:", device)
+    tracker = DroneTrackerPro(device)
 
-    # Load model YOLO
-    model = YOLO(YOLO_WEIGHTS)
+    cap = cv2.VideoCapture(0)
 
-    # Tạo backbone trích đặc trưng
-    backbone = build_feature_extractor(device)
+    # ========== VIDEO WRITER ==========
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fps = 30
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter("drone_tracking_output.mp4", fourcc, fps, (w, h))
+    # ==================================
 
-    # Mở camera
-    cap = cv2.VideoCapture(0)  # "0" là webcam mặc định
-    if not cap.isOpened():
-        print("Không mở được camera")
-        return
-
-    # Trạng thái tracking
-    target_emb = None          # vector đặc trưng 512-D của mục tiêu
-    target_box = None          # box hiện tại của mục tiêu (x1, y1, x2, y2)
-    target_lost = True
-    target_last_sim = 0.0
-    frames_since_seen = 0
-
-    window_name = "YOLOv8 + Deep Embedding Tracking - ABSOLUTE ID"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    print("Nhấn S: lock target")
+    print("Nhấn R: reset")
+    print("Nhấn Q: thoát")
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Không đọc được frame từ camera")
+        ok, frame = cap.read()
+        if not ok:
             break
 
-        frame_display = frame.copy()
         h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2  # tâm khung hình
+        cx, cy = w//2, h//2
 
-        # Vẽ dấu + ở tâm để căn mục tiêu khi nhấn 's'
-        cv2.drawMarker(
-            frame_display,
-            (cx, cy),
-            (255, 255, 255),
-            markerType=cv2.MARKER_CROSS,
-            markerSize=25,
-            thickness=2
-        )
+        cv2.drawMarker(frame, (cx, cy), (255, 255, 255),
+                       cv2.MARKER_CROSS, 30, 3)
 
-        # 1. Chạy YOLO detect người (class 0)
-        results = model(
-            frame,
-            conf=CONF_THRES,
-            classes=[39]   # 0 = 'person' trong COCO
-        )[0]
-        detections = get_detections(results)
+        res = model(frame, conf=0.3, classes=[0])[0]
+        dets = []
 
-        # Vẽ tất cả detection (xám) để debug
-        for x1, y1, x2, y2, conf, cls_id in detections:
-            cv2.rectangle(frame_display, (x1, y1), (x2, y2), (100, 100, 100), 1)
-            cv2.putText(
-                frame_display,
-                f"class:{cls_id} conf:{conf:.2f}",
-                (x1, y2 + 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (100, 100, 100),
-                1
-            )
+        for b in res.boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0].cpu().numpy())
+            dets.append((x1, y1, x2, y2, float(b.conf), int(b.cls)))
 
-        # 2. Nếu đã có target_emb => tìm detection giống nhất bằng cosine similarity
-        detect_match = False
+        tracks = tracker.update(dets, frame)
 
-        if target_emb is not None and len(detections) > 0:
-            best_sim = -1.0
-            best_box = None
+        lock_box = None
+        for tid, x1, y1, x2, y2, miss in tracks:
+            color = (150,150,150) if miss == 0 else (60,60,60)
+            cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
+            cv2.putText(frame, f"ID:{tid}", (x1,y1-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-            for x1, y1, x2, y2, conf, cls_id in detections:
-                roi = safe_crop(frame, (x1, y1, x2, y2))
-                if roi is None or roi.size == 0:
-                    continue
+            if tid == tracker.target_id:
+                lock_box = (x1,y1,x2,y2)
 
-                emb = compute_embedding(roi, backbone, device)
-                if emb is None:
-                    continue
+        if lock_box:
+            x1,y1,x2,y2 = lock_box
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 3)
+            cv2.putText(frame, f"TARGET {tracker.target_id}",
+                        (x1,y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (0,255,0), 2)
 
-                # Cosine similarity do target_emb đã L2-norm
-                sim = float(np.dot(target_emb, emb))
+        # ==== GHI VIDEO ====
+        out.write(frame)
+        # ====================
 
-                if sim > best_sim:
-                    best_sim = sim
-                    best_box = (x1, y1, x2, y2)
+        cv2.imshow("DRONE TRACKER PRO 2.0 - Recording", frame)
 
-            if best_box is not None and best_sim > EMB_SIM_THRESHOLD:
-                detect_match = True
-                target_box = best_box
-                target_lost = False
-                target_last_sim = best_sim
-                frames_since_seen = 0
-            else:
-                target_lost = True
-                frames_since_seen += 1
-
-        # 3. VẼ THÔNG TIN MỤC TIÊU
-        if target_box is not None and not target_lost:
-            x1, y1, x2, y2 = target_box
-
-            # Khung xanh cho target
-            cv2.rectangle(frame_display, (x1, y1), (x2, y2), (0, 255, 0), 3)
-
-            # LABEL trên khung
-            label_pos_y = y1 - 15 if y1 - 15 > 30 else y1 + 25
-            cv2.putText(
-                frame_display,
-                f"TARGET_ID: {TARGET_ABS_ID}",
-                (x1, label_pos_y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 0),
-                2
-            )
-
-            # Thông tin phía trên
-            info_text = f"TARGET_ID = {TARGET_ABS_ID} | sim = {target_last_sim:.2f}"
-            cv2.putText(
-                frame_display,
-                info_text,
-                (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 255, 255),
-                2
-            )
-
-            mode_text = "Nguon: YOLO + deep embedding"
-            cv2.putText(
-                frame_display,
-                mode_text,
-                (30, 95),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2
-            )
-
-        elif target_emb is not None:
-            # Đã có mục tiêu nhưng mất tạm thời
-            info_text = f"MAT MUC TIEU (TARGET_ID = {TARGET_ABS_ID}) - frames mat: {frames_since_seen}"
-            cv2.putText(
-                frame_display,
-                info_text,
-                (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (0, 0, 255),
-                2
-            )
-            cv2.putText(
-                frame_display,
-                "Khi muc tieu quay lai, YOLO + embedding se nhan lai dung nguoi.",
-                (30, 95),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2
-            )
-        else:
-            # Chưa chọn mục tiêu
-            cv2.putText(
-                frame_display,
-                "Dat muc tieu gan dau '+' roi nhan 's' de KHOA, 'r' reset, 'q' thoat",
-                (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-        cv2.imshow(window_name, frame_display)
-
-        # 4. PHÍM BẤM
         key = cv2.waitKey(1) & 0xFF
-
         if key == ord('q'):
             break
 
-        if key == ord('s'):
-            # Khóa mục tiêu: chọn detection gần tâm khung nhất
-            if len(detections) == 0:
-                print("Khong co detection nao khi nhan 's' - hay dam bao co nguoi trong khung.")
-            else:
-                best_det = None
-                best_dist = None
-
-                for det in detections:
-                    x1, y1, x2, y2, conf, cls_id = det
-                    bx = (x1 + x2) / 2.0
-                    by = (y1 + y2) / 2.0
-                    dist2 = (bx - cx) ** 2 + (by - cy) ** 2
-
-                    if best_dist is None or dist2 < best_dist:
-                        best_dist = dist2
-                        best_det = det
-
-                if best_det is not None:
-                    x1, y1, x2, y2, conf, cls_id = best_det
-                    roi = safe_crop(frame, (x1, y1, x2, y2))
-                    emb = compute_embedding(roi, backbone, device)
-                    if emb is not None:
-                        target_emb = emb
-                        target_box = (x1, y1, x2, y2)
-                        target_lost = False
-                        target_last_sim = 1.0
-                        frames_since_seen = 0
-                        print(f"Da KHOA muc tieu gan tam khung, TARGET_ID = {TARGET_ABS_ID}.")
-
         if key == ord('r'):
-            # Reset mục tiêu
-            target_emb = None
-            target_box = None
-            target_lost = True
-            target_last_sim = 0.0
-            frames_since_seen = 0
+            tracker.target_id = None
+            tracker.target_sig = None
+            print("Target reset.")
 
-            print("Da reset muc tieu, dat lai muc tieu gan tam va nhan 's'.")
+        if key == ord('s'):
+            best = None
+            best_d = 1e12
+            for tid, x1, y1, x2, y2, _ in tracks:
+                bx = (x1+x2)/2
+                by = (y1+y2)/2
+                d = (bx-cx)**2 + (by-cy)**2
+                if d < best_d:
+                    best_d = d
+                    best = tid
+
+            if best is not None:
+                tracker.target_id = best
+                for t in tracker.trackers:
+                    if t.id == best:
+                        tracker.target_sig = t.memory.signature()
+                print("Locked target:", best)
 
     cap.release()
+    out.release()
     cv2.destroyAllWindows()
 
 

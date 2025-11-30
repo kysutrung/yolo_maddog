@@ -44,11 +44,10 @@ except ImportError:
     SCIPY_OK = False
 
 # =================== Configuration ===================
-WEIGHTS        = "yolo_weights/yolov8m.engine"
+WEIGHTS        = "yolo_weights/yolov8m.pt"
 USE_GPU        = True
 CONF_THRES     = 0.30
 CLASSES        = [0, 2, 3]
-TRACKER_CFG    = "bytetrack.yaml"  # giữ lại cho đủ config, không dùng trực tiếp
 PERSIST_ID     = True
 SAVE_OUTPUT    = False
 CAM_INDEX      = 0
@@ -133,11 +132,50 @@ def cosine_sim(a, b):
         return 0.0
     return float(np.dot(a, b) / den)
 
+# ================== PID controller ==================
+class PID:
+    def __init__(self, kp, ki, kd, out_min=-1.0, out_max=1.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.out_min = out_min
+        self.out_max = out_max
+
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.initialized = False
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = 0.0
+        self.initialized = False
+
+    def update(self, error, dt):
+        if dt <= 0.0:
+            dt = 1e-3
+
+        if not self.initialized:
+            self.prev_err = error
+            self.initialized = True
+
+        p = self.kp * error
+
+        self.integral += error * dt
+        self.integral = max(min(self.integral, 10.0), -10.0)
+        i = self.ki * self.integral
+
+        d = self.kd * (error - self.prev_err) / dt
+        self.prev_err = error
+
+        u = p + i + d
+        if u > self.out_max:
+            u = self.out_max
+        elif u < self.out_min:
+            u = self.out_min
+        return u
+
 # ================== Drawing helpers ==================
 def draw_tracks(frame, tracks, selected_id, names, show=True, allowed_classes=None):
-    """
-    tracks: list of dict {'id', 'cls', 'conf', 'bbox'}
-    """
     if not show or tracks is None:
         return frame
 
@@ -208,7 +246,7 @@ def make_cv_tracker(name=CV_TRACKER_TYPE):
         return legacy.TrackerMOSSE_create() if legacy and hasattr(legacy, "TrackerMOSSE_create") else cv2.TrackerMOSSE_create()
     return legacy.TrackerCSRT_create() if legacy and hasattr(legacy, "TrackerCSRT_create") else cv2.TrackerCSRT_create()
 
-# ================== Gap Predictor (không dùng chính, giữ cho backward compat) ==================
+# ================== Gap Predictor (giữ cho backward compat, dùng để show box PRED nếu muốn) ==================
 class GapPredictor:
     def __init__(self, frame_size, max_gap=12, damping=0.88):
         self.W, self.H = frame_size
@@ -302,11 +340,7 @@ class GamepadBridge:
         self.vpad.update()
 
 # ================== ReID + Kalman + Hungarian ==================
-
 class ReIDExtractor:
-    """
-    Dùng ResNet50 (torchvision) để trích đặc trưng Re-ID.
-    """
     def __init__(self, device="cpu"):
         self.enabled = TORCH_OK
         if not TORCH_OK:
@@ -315,12 +349,10 @@ class ReIDExtractor:
             return
         self.device = torch.device(device)
         try:
-            # Với torch >= 2.0
             base = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         except Exception:
-            # Fallback cho version cũ
             base = models.resnet50(pretrained=True)
-        modules = list(base.children())[:-1]  # bỏ layer FC
+        modules = list(base.children())[:-1]
         self.model = torch.nn.Sequential(*modules).to(self.device)
         self.model.eval()
         self.transform = transforms.Compose([
@@ -355,11 +387,7 @@ class ReIDExtractor:
         feat = feat / (feat.norm(p=2, dim=1, keepdim=True) + 1e-12)
         return feat[0].cpu().numpy()
 
-
 class KalmanBoxTracker:
-    """
-    Kalman Filter cho bbox: state = [cx, cy, w, h, vx, vy, vw, vh]
-    """
     def __init__(self, box_xyxy, dt=1.0):
         self.dt = dt
         self.dim_x = 8
@@ -428,7 +456,6 @@ class KalmanBoxTracker:
     def get_state_bbox(self):
         return self._state_to_box()
 
-
 class Track:
     _next_id = 0
 
@@ -464,16 +491,11 @@ class Track:
             else:
                 self.feature = 0.8 * self.feature + 0.2 * feature
 
-
 def hungarian_assignment(cost_matrix):
-    """
-    Wrapper dùng Hungarian (scipy) nếu có, không có thì dùng greedy fallback.
-    """
     if linear_sum_assignment is not None:
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         return list(zip(row_ind, col_ind))
 
-    # Fallback: greedy matching
     num_rows, num_cols = cost_matrix.shape
     used_rows = set()
     used_cols = set()
@@ -497,15 +519,7 @@ def hungarian_assignment(cost_matrix):
         used_cols.add(min_c)
     return matches
 
-
 class MultiObjectTracker:
-    """
-    Tracking-by-detection:
-        - YOLO: detection
-        - Kalman Filter: motion
-        - ResNet50: appearance (Re-ID)
-        - Hungarian: assignment
-    """
     def __init__(self, reid_extractor=None,
                  max_age=30,
                  min_hits=1,
@@ -528,14 +542,9 @@ class MultiObjectTracker:
         self.tracks.append(t)
 
     def update(self, frame_bgr, detections):
-        """
-        detections: list[{"box": (x1,y1,x2,y2), "score": float, "cls": int}]
-        """
-        # Step 0: predict tất cả track hiện tại
         for t in self.tracks:
             t.predict()
 
-        # Step 1: chuẩn bị feature cho detection (ReID)
         det_features = []
         for det in detections:
             if self.reid is not None and self.reid.enabled:
@@ -545,7 +554,6 @@ class MultiObjectTracker:
             det_features.append(feat)
 
         if len(detections) == 0:
-            # chỉ giữ lại track chưa quá cũ
             self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
             return list(self.tracks)
 
@@ -554,7 +562,6 @@ class MultiObjectTracker:
                 self._start_new_track(det, feat)
             return list(self.tracks)
 
-        # Step 2: tạo cost matrix cho Hungarian
         N = len(self.tracks)
         M = len(detections)
         cost_matrix = np.zeros((N, M), dtype=np.float32)
@@ -579,7 +586,6 @@ class MultiObjectTracker:
                 cost_matrix[ti, di] = (1.0 - self.appearance_weight) * one_minus_iou + \
                                       self.appearance_weight * app_cost
 
-        # Step 3: Hungarian assignment
         matches = hungarian_assignment(cost_matrix)
 
         matched_tracks = set()
@@ -596,14 +602,12 @@ class MultiObjectTracker:
             feat = det_features[di]
             self.tracks[ti].update(det["box"], det["cls"], det["score"], feat)
 
-        # Step 4: unmatched detections -> new tracks
         unmatched_det_indices = [di for di in range(M) if di not in matched_dets]
         for di in unmatched_det_indices:
             det = detections[di]
             feat = det_features[di]
             self._start_new_track(det, feat)
 
-        # Step 5: xóa track quá cũ
         self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
 
         return list(self.tracks)
@@ -626,7 +630,6 @@ class App(tk.Tk):
         self.video_ready = False
         self.gp = GamepadBridge()
 
-        # device cho YOLO + ReID
         if TORCH_OK and USE_GPU and torch.cuda.is_available():
             self.device = "cuda"
         else:
@@ -635,63 +638,50 @@ class App(tk.Tk):
         self.model = YOLO(WEIGHTS)
         self.names = self.model.names
 
-        # ReID + Tracker mới
         self.reid = ReIDExtractor(device=self.device) if TORCH_OK else None
         self.tracker = MultiObjectTracker(self.reid)
 
-        # Re-ID signature cho mục tiêu được chọn (giữ để re-ID khi quay lại)
         self.selected_identity_feat = None
-        self.reid_reacq_thr = 0.70  # ngưỡng Re-ID để nhận lại mục tiêu
+        self.reid_reacq_thr = 0.70
         self.target_lost_flag = False
 
-        # hiển thị & chọn mục tiêu
         self.show_boxes = False
         self.bbox_btn_var = tk.StringVar(value="Object Detection: OFF")
         self.lock_target = False
         self.lock_btn_var = tk.StringVar(value="Target Lock: OFF")
 
-        # Target Follow
         self.target_follow = False
         self.follow_btn_var = tk.StringVar(value="Target Follow: OFF")
 
-        # FPS
         self._fps_frame_count = 0
         self._fps_last_time = time.monotonic()
         self._fps_value = 0.0
         self.fps_var = tk.StringVar(value="FPS: 0.0")
 
-        # lọc theo lớp
         self.filter_var = tk.StringVar(value="All")
         self.display_allowed = None
 
-        # flight buttons
         self._flight_btns = []
 
-        # reselect / lock
         self.lock_signature = None
         self.reselect_signature = None
-        self.last_tracks = {}   # id -> cls_id
+        self.last_tracks = {}
 
-        # log queue
         self.log_queue = queue.Queue()
 
-        # styles
         self._init_styles()
 
-        # ---- Auto ramp settings ----
-        self.RY_CAP = 0.300
+        self.RY_CAP = 0.50
         self.RY_STEP = 0.05
         self.RX_CAP = 0.15
         self.RX_STEP = 0.05
         self.LX_CAP = 0.15
         self.LX_STEP = 0.05
 
-        # Giá trị hiện tại (Auto) gửi ra vgamepad
         self.auto_ry = 0.0
         self.auto_rx = 0.0
         self.auto_lx = 0.0
 
-        # Ramp state (manual holds)
         self._ramp_job = None
         self._forward_holding = False
         self._back_holding = False
@@ -700,7 +690,6 @@ class App(tk.Tk):
         self._yaw_left_holding = False
         self._yaw_right_holding = False
 
-        # Auto-hold flags/timers
         self._auto_left = False
         self._auto_right = False
         self._auto_yaw_left = False
@@ -712,10 +701,8 @@ class App(tk.Tk):
         self._nav_back_until = 0.0
         self._nav_forward_until = 0.0
 
-        # giữ LY khi vào Auto
         self.auto_ly_hold = 0.0
 
-        # ===== Enhanced follow states (giữ cấu trúc cũ) =====
         self.PRED_IOU_THR = REACQ_IOU_THR
         self.PRED_MAX_GAP = PRED_MAX_GAP
         self.pred = GapPredictor((VIDEO_W, VIDEO_H), max_gap=self.PRED_MAX_GAP, damping=0.88)
@@ -725,11 +712,9 @@ class App(tk.Tk):
         self.cv_tracker = None
         self.hist_sim_thr = HIST_SIM_THR
 
-        # ===== Navigation (logs only) =====
         self.nav_dead_zone_px = NAV_DEAD_ZONE_PX
         self.last_nav_cmd = None
 
-        # ===== Distance Estimation =====
         self.ref_rect = None
         self.ref_area = None
         self.last_distance_state = None
@@ -737,9 +722,19 @@ class App(tk.Tk):
         self.dist_thr_near_high = 1.30
         self.draw_ref_rect = True
 
+        # PID controllers cho Target Follow
+        self.yaw_pid = PID(
+            kp=0.4, ki=0.0, kd=0.15,
+            out_min=-self.LX_CAP, out_max=self.LX_CAP
+        )
+        self.pitch_pid = PID(
+            kp=0.5, ki=0.0, kd=0.10,
+            out_min=-self.RY_CAP, out_max=self.RY_CAP
+        )
+        self._last_pid_time = time.monotonic()
+
         self._build_ui()
 
-        # key bindings
         for key, func in {
             "<Escape>": self.on_close,
             "<s>": self.on_key_s,
@@ -782,7 +777,6 @@ class App(tk.Tk):
         enabled_select = (self.show_boxes and not self.lock_target)
         for b in (self.btn_select, self.btn_switch_target):
             b.configure(state=("normal" if enabled_select else "disabled"))
-        # Follow & Approach chỉ khi Auto + có target + OD ON
         follow_enabled = (self.show_boxes and self.selected_id is not None and self.gp.state == ForwardState.OFF)
         self.btn_follow.configure(state=("normal" if follow_enabled else "disabled"))
         self.btn_approach.configure(state=("normal" if follow_enabled else "disabled"))
@@ -847,7 +841,6 @@ class App(tk.Tk):
 
         ttk.Frame(root).pack(side="left", fill="both", expand=True)
 
-        # LEFT video
         left = ttk.Frame(root, width=VIDEO_W, height=VIDEO_H)
         left.pack(side="left")
         left.pack_propagate(False)
@@ -856,19 +849,16 @@ class App(tk.Tk):
 
         ttk.Frame(root).pack(side="left", fill="both", expand=True)
 
-        # RIGHT panel with right-edge gap
         right = ttk.Frame(root, width=RIGHT_PANEL_W)
         right.pack(side="left", fill="y", padx=(0, 50))
         right.pack_propagate(False)
 
-        # ---- 1) Flight Mode (top)
         flight = ttk.Frame(right)
         self.state_var = tk.StringVar(value=f"Flight Mode: {self.gp.state}")
         ttk.Label(flight, textvariable=self.state_var, style="Section.TLabel").pack(anchor="w", pady=(0, 4))
         ttk.Button(flight, text="Switch Mode", command=self.toggle_forward,
                    style="Compact.TButton").pack(fill="x")
 
-        # ---- 2) Autonomous Control group
         ac = ttk.Frame(right)
         ttk.Label(ac, text="Autonomous Control", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
@@ -901,7 +891,6 @@ class App(tk.Tk):
             self.btn_up, self.btn_down, self.btn_yaw_left, self.btn_yaw_right
         ]
 
-        # ---- Target control row
         tc = ttk.Frame(ac)
         tc.pack(fill="x", pady=(0, 4))
         self.btn_select = ttk.Button(tc, text="Select", command=self.on_key_s,
@@ -914,7 +903,6 @@ class App(tk.Tk):
         tc.grid_columnconfigure(0, weight=1, uniform="tc")
         tc.grid_columnconfigure(1, weight=1, uniform="tc")
 
-        # Toggles row
         toggles = ttk.Frame(ac)
         toggles.pack(fill="x", pady=(0, 6))
         self.btn_bbox = ttk.Button(toggles, textvariable=self.bbox_btn_var,
@@ -926,7 +914,6 @@ class App(tk.Tk):
         toggles.grid_columnconfigure(0, weight=1, uniform="tog")
         toggles.grid_columnconfigure(1, weight=1, uniform="tog")
 
-        # Filter row
         filt_row = ttk.Frame(ac)
         filt_row.pack(fill="x", pady=(0, 6))
         ttk.Label(filt_row, text="Show:", style="Compact.TLabel", width=8).grid(row=0, column=0, sticky="w")
@@ -941,7 +928,6 @@ class App(tk.Tk):
         filt_row.grid_columnconfigure(1, weight=1)
         self.filter_combo.bind("<<ComboboxSelected>>", self.on_filter_change)
 
-        # Follow + buttons
         self.btn_follow = ttk.Button(ac, textvariable=self.follow_btn_var,
                                      command=self.toggle_follow, style="Compact.TButton")
         self.btn_follow.pack(fill="x", pady=(0, 4))
@@ -954,7 +940,6 @@ class App(tk.Tk):
                                  command=self.cmd_function_x, style="Compact.TButton")
         self.btn_fx.pack(fill="x")
 
-        # Bind press/release cho ramp (Auto)
         self.btn_forward.bind("<ButtonPress-1>", self._forward_press)
         self.btn_forward.bind("<ButtonRelease-1>", self._forward_release)
         self.btn_back.bind("<ButtonPress-1>", self._back_press)
@@ -968,7 +953,6 @@ class App(tk.Tk):
         self.btn_yaw_right.bind("<ButtonPress-1>", self._yaw_right_press)
         self.btn_yaw_right.bind("<ButtonRelease-1>", self._yaw_right_release)
 
-        # ---- 3) Control Parameters
         params = ttk.Frame(right)
         ttk.Label(params, text="Control Parameters", style="Section.TLabel").pack(anchor="w", pady=(0, 4))
         telem = ttk.Frame(params)
@@ -1006,7 +990,6 @@ class App(tk.Tk):
         telem.grid_columnconfigure(1, weight=1)
         telem.grid_columnconfigure(2, weight=1)
 
-        # ---- 4) Logs
         logs = ttk.Frame(right)
         ttk.Label(logs, text="Logs", style="Section.TLabel").pack(anchor="w", pady=(0, 4))
         log_holder = ttk.Frame(logs, height=110)
@@ -1018,7 +1001,6 @@ class App(tk.Tk):
         log_scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-        # ---- 5) FPS (footer)
         fps_panel = ttk.Frame(right)
         ttk.Label(fps_panel, textvariable=self.fps_var, style="Foot.TLabel").pack(anchor="w")
 
@@ -1166,10 +1148,16 @@ class App(tk.Tk):
             cls_id, cls_name = self._get_class_for_id(self.selected_id)
             self.log(f"Target Follow -> ON (ID={self.selected_id}{', class=' + str(cls_name) if cls_name else ''})")
             self.last_nav_cmd = None
+            self.yaw_pid.reset()
+            self.pitch_pid.reset()
         else:
             self.log("Target Follow -> OFF")
             self.last_nav_cmd = None
             self._clear_auto_holds()
+            self.yaw_pid.reset()
+            self.pitch_pid.reset()
+            self.auto_lx = 0.0
+            self.auto_ry = 0.0
 
     def cmd_target_approach(self):
         if self.gp.state != ForwardState.OFF or not self.show_boxes or self.selected_id is None:
@@ -1200,7 +1188,6 @@ class App(tk.Tk):
             return
         if self.available_ids:
             if self.selected_id is None:
-                # select target
                 self.selected_id = self.available_ids[0]
                 cls_id, cls_name = self._get_class_for_id(self.selected_id)
                 self.reselect_signature = (int(self.selected_id), int(cls_id), str(cls_name)) if cls_id is not None else None
@@ -1209,7 +1196,6 @@ class App(tk.Tk):
                 self.log(f"Selected target ID={self.selected_id}")
                 self.last_nav_cmd = None
             else:
-                # deselect target
                 self.log("Target deselected")
                 self.selected_id = None
                 self.reselect_signature = None
@@ -1402,7 +1388,7 @@ class App(tk.Tk):
 
     def _ramp_tick(self):
         self._ramp_job = None
-        if self.gp.state != ForwardState.OFF:
+        if self.gp.state != ForwardState.OFF or self.target_follow:
             return
 
         right_eff = self._right_holding
@@ -1568,6 +1554,48 @@ class App(tk.Tk):
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
         return frame
 
+    # ===== PID control for Target Follow =====
+    def _target_follow_pid(self, frame_w, frame_h, current_target_box):
+        if not (self.target_follow and self.gp.state == ForwardState.OFF and current_target_box is not None):
+            self.yaw_pid.reset()
+            self.pitch_pid.reset()
+            self.auto_lx = 0.0
+            self.auto_ry = 0.0
+            return
+
+        # vô hiệu hóa auto_nav + ramp trong khi PID điều khiển
+        self._nav_left_until = self._nav_right_until = 0.0
+        self._nav_forward_until = self._nav_back_until = 0.0
+        self._auto_left = self._auto_right = False
+        self._auto_forward = self._auto_back = False
+        self._auto_yaw_left = self._auto_yaw_right = False
+        self._forward_holding = self._back_holding = False
+        self._left_holding = self._right_holding = False
+        self._yaw_left_holding = self._yaw_right_holding = False
+        self._stop_ramp()
+
+        now = time.monotonic()
+        dt = now - self._last_pid_time
+        self._last_pid_time = now
+        if dt <= 0.0 or dt > 0.5:
+            dt = 1.0 / TARGET_FPS
+
+        x1, y1, x2, y2 = current_target_box
+        cx_obj = 0.5 * (x1 + x2)
+
+        # PID YAW -> LX
+        e_yaw = (cx_obj - frame_w / 2.0) / (frame_w / 2.0)
+        yaw_cmd = self.yaw_pid.update(e_yaw, dt)
+        self.auto_lx = yaw_cmd
+
+        # PID PITCH -> RY, dựa trên diện tích bbox
+        if self.ref_area is not None and self.ref_area > 0:
+            area = max(1.0, (x2 - x1)) * max(1.0, (y2 - y1))
+            ratio = area / (self.ref_area + 1e-6)
+            e_pitch = 1.0 - ratio
+            pitch_cmd = self.pitch_pid.update(e_pitch, dt)
+            self.auto_ry = pitch_cmd
+
     def _loop_worker(self):
         cap = cv2.VideoCapture(CAM_INDEX)
         if not cap.isOpened():
@@ -1579,7 +1607,6 @@ class App(tk.Tk):
             if not ret:
                 continue
 
-            # ===== FPS counting =====
             self._fps_frame_count += 1
             now = time.monotonic()
             dt = now - self._fps_last_time
@@ -1588,7 +1615,6 @@ class App(tk.Tk):
                 self._fps_frame_count = 0
                 self._fps_last_time = now
 
-            # ===== YOLO detection =====
             try:
                 results = self.model.predict(
                     frame,
@@ -1615,10 +1641,8 @@ class App(tk.Tk):
                         "cls": int(cls_id)
                     })
 
-            # ===== Advanced tracker: YOLO + ReID + Kalman + Hungarian =====
             tracks = self.tracker.update(frame, detections)
 
-            # Build maps cho UI
             self.last_tracks = {}
             id_to_box = {}
             id_to_area = {}
@@ -1633,7 +1657,6 @@ class App(tk.Tk):
 
             self._rebuild_available_ids()
 
-            # Reacquire theo Lock (ID-based, trong khi track còn sống)
             if self.lock_target and self.lock_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.lock_signature
                 cond_in_filter = (self.display_allowed is None) or (sig_cls_id in self.display_allowed)
@@ -1644,7 +1667,6 @@ class App(tk.Tk):
                     self.target_lost_flag = False
                     self.log(f"Reacquired locked target ID={sig_id} class={sig_cls_name}")
 
-            # Restore theo reselect_signature khi ID vẫn tồn tại
             if (not self.lock_target) and self.reselect_signature is not None and self.selected_id is None and self.show_boxes:
                 sig_id, sig_cls_id, sig_cls_name = self.reselect_signature
                 cond_in_filter = (self.display_allowed is None) or (sig_cls_id in self.display_allowed)
@@ -1654,13 +1676,11 @@ class App(tk.Tk):
                     self.target_lost_flag = False
                     self.log(f"Restored selection for target ID={sig_id} class={sig_cls_name}")
 
-            # Handle selected target + predicted_box, update Re-ID signature
             current_target_box = None
             is_predicted_only = False
             if self.show_boxes and self.selected_id is not None:
                 sel_id = int(self.selected_id)
 
-                # Cập nhật Re-ID feature khi target đang nhìn thấy
                 if sel_id in id_to_box:
                     for t in tracks:
                         if int(t.track_id) == sel_id and t.feature is not None:
@@ -1677,7 +1697,6 @@ class App(tk.Tk):
                             is_predicted_only = (t.time_since_update > 0)
                             break
                 else:
-                    # Track của mục tiêu đã biến mất (ra khỏi FOV quá lâu -> bị xóa)
                     if not self.target_lost_flag:
                         self.log(f"TARGET LOST (ID={sel_id})")
                         self.target_lost_flag = True
@@ -1696,7 +1715,6 @@ class App(tk.Tk):
 
             self.predicted_box = current_target_box if (current_target_box is not None and is_predicted_only) else None
 
-            # ===== Long-term Re-ID based reacquisition =====
             if (self.selected_id is None
                 and self.show_boxes
                 and self.selected_identity_feat is not None
@@ -1724,7 +1742,6 @@ class App(tk.Tk):
                     self.target_lost_flag = False
                     self.log(f"Re-ID reacquired target -> ID={best_id}, class={cls_name}, sim={best_sim:.2f}")
 
-            # Manual control I/O
             r_lx, r_ly, r_rx, r_ry = self.gp.read_axes_real()
             if self.gp.state == ForwardState.ARMING:
                 if all(abs(a - b) <= ARM_EPS for a, b in zip(
@@ -1735,7 +1752,6 @@ class App(tk.Tk):
             elif self.gp.state == ForwardState.ON:
                 self.gp.send_to_virtual(r_lx, r_ly, r_rx, r_ry)
 
-            # ===== Vẽ frame =====
             frame_draw = frame.copy()
             frame_h, frame_w = frame_draw.shape[:2]
 
@@ -1762,43 +1778,15 @@ class App(tk.Tk):
             frame_draw = self._draw_reference_rect(frame_draw, color=(220, 220, 220))
             draw_crosshair_center(frame_draw, size=CROSSHAIR_CENTER_SIZE, color=(255, 0, 0))
 
+            # PID-based Target Follow control
+            self._target_follow_pid(frame_w, frame_h, current_target_box)
+
+            # Optional: chỉ log distance state (không điều khiển nav_hold nữa)
             if self.target_follow and self.gp.state == ForwardState.OFF and current_target_box is not None:
-                x1, y1, x2, y2 = current_target_box
-                cx_obj, cy_obj = int((x1 + x2) // 2), int((y1 + y2) // 2)
-                draw_crosshair_at(frame_draw, cx_obj, cy_obj, size=CROSSHAIR_TARGET_SIZE, color=(0, 255, 255))
-                dx = cx_obj - (frame_w // 2)
-
-                horiz = None
-                if abs(dx) > self.nav_dead_zone_px:
-                    horiz = "Right" if dx > 0 else "Left"
-
-                cmd_text = horiz if horiz else "Hold"
-                if cmd_text != self.last_nav_cmd:
-                    self.log(f"NAV CMD -> {cmd_text}")
-                    self.last_nav_cmd = cmd_text
-
-                now2 = time.monotonic()
-                if horiz == "Right":
-                    self._nav_right_until = now2 + 1.0
-                    self._nav_left_until = 0.0
-                elif horiz == "Left":
-                    self._nav_left_until = now2 + 1.0
-                    self._nav_right_until = 0.0
-
                 dist_state, ratio = self._estimate_distance_state(current_target_box)
-                if dist_state is not None:
-                    if dist_state != self.last_distance_state:
-                        self.last_distance_state = dist_state
-                        self.log(f"Distance state -> {dist_state} (ratio={ratio:.2f})")
-                    if dist_state == "Far":
-                        self._nav_forward_until = now2 + 1.0
-                        self._nav_back_until = 0.0
-                    elif dist_state == "Too Close":
-                        self._nav_back_until = now2 + 1.0
-                        self._nav_forward_until = 0.0
-            else:
-                if self.last_nav_cmd is not None and (not self.target_follow or self.gp.state != ForwardState.OFF):
-                    self.last_nav_cmd = None
+                if dist_state is not None and dist_state != self.last_distance_state:
+                    self.last_distance_state = dist_state
+                    self.log(f"Distance state -> {dist_state} (ratio={ratio:.2f})")
 
             fixed = resize_with_letterbox(frame_draw, VIDEO_W, VIDEO_H)
             with self.frame_lock:
@@ -1820,6 +1808,8 @@ class App(tk.Tk):
 
         self.fps_var.set(f"FPS: {self._fps_value:0.1f}")
 
+        # giữ _apply_auto_nav_holds cho trường hợp bạn muốn dùng nav_hold kiểu cũ (không PID)
+        # nhưng nó sẽ không làm gì khi target_follow đang bật và PID chịu trách nhiệm
         self._apply_auto_nav_holds()
 
         vals = [self.gp.r_lx, self.gp.r_ly, self.gp.r_rx, self.gp.r_ry]

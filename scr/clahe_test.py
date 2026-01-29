@@ -1,1 +1,0 @@
-#tăng tương phản hình ảnh

@@ -50,7 +50,7 @@ CONF_THRES     = 0.30
 CLASSES        = [0, 2, 3]
 PERSIST_ID     = True
 SAVE_OUTPUT    = False
-CAM_INDEX      = 1
+CAM_INDEX      = 0
 TARGET_FPS     = 30
 
 AX_LX, AX_LY, AX_RY, AX_RX = 0, 1, 2, 3

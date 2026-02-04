@@ -8,7 +8,7 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 import queue
-import time
+import time 
 
 # -------- Optional dependencies --------
 try:
